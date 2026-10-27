@@ -1,0 +1,57 @@
+{
+  "name": "forex-trading-bot",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Forex signal engine with live OANDA data, 3% risk sizing, 2R targets, and a simulated trading dashboard.",
+  "type": "module",
+  "homepage": "https://github.com/Dzuhaib/AI-Forex-Trading-Bot#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dzuhaib/AI-Forex-Trading-Bot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Dzuhaib/AI-Forex-Trading-Bot/issues"
+  },
+  "keywords": [
+    "forex",
+    "trading-bot",
+    "oanda",
+    "trading-signals",
+    "risk-management",
+    "technical-analysis",
+    "typescript",
+    "react",
+    "nodejs",
+    "express",
+    "vite",
+    "tailwindcss"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx server.ts",
+    "start": "tsx server.ts",
+    "build": "vite build",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^6.1.1",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "lucide-react": "^0.546.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "vite": "^8.3.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.21.0",
+    "typescript": "^7.0.2"
+  }
+}
