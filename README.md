@@ -36,9 +36,9 @@ Signals · Risk management · Live analytics · Trade journal · Account simulat
 
 **Forex Trading Bot** is a self-hosted Forex dashboard that turns live OANDA price data into actionable, risk-defined trade ideas. It scans 14 FX, metal, energy, and crypto instruments, detects high-volume untested supply and demand zones, confirms entries with M1 reversal volume, and tracks each idea through take profit, stop loss, ambiguity, or expiry.
 
-The app combines a real-time signal engine with a polished React interface, a simulated account, a trade journal, balance controls, and withdrawal requests. It is designed as an educational and research platform for building disciplined, risk-first trading workflows.
+The app combines a real-time signal engine with a polished React interface, a simulated account, a trade journal, and balance controls. It is designed as an educational and research platform for building disciplined, risk-first trading workflows.
 
-> **This is a demo trading system.** Signals and trades are simulated. The project does not place live orders or send real payouts.
+> **This is a demo trading system.** Signals and trades are simulated. The project does not place live orders.
 
 ---
 
@@ -50,7 +50,7 @@ Most signal dashboards stop at a marker on a chart. This project focuses on the 
 - **Fixed 2R targets** — take profit is always **2x the stop distance**.
 - **Live market context** — current price, entry, stop, target, R multiple, and progress.
 - **A visual trade state** — each open signal includes a compact SL-vs-TP tug-of-war scene with the live market marker and entry point.
-- **A simulated account** — realized PnL, floating PnL, equity, withdrawals, deposits, and trade history.
+- **A simulated account** — realized PnL, floating PnL, equity, deposits, and trade history.
 - **Operational safety** — same-origin mutation checks, rate limiting, JSON body limits, and hardened response headers.
 
 ---
@@ -87,12 +87,11 @@ Most signal dashboards stop at a marker on a chart. This project focuses on the 
 - Account summary with balance, equity, realized PnL, floating PnL, and open trade count.
 - Trade history with entry, stop, target, exit, lot size, and outcome.
 - Balance deposits and lot-size controls.
-- JazzCash and Easypaisa withdrawal request form with validation.
 
 ### Engineering
 
 - Shared TypeScript types between server and client.
-- Persistent local state file for signals, trades, account balance, and withdrawals.
+- Persistent local state file for signals, trades, and account balance.
 - Express API with Vite middleware in development.
 - Security headers and mutation protection.
 - Reduced-motion support for dashboard animations.
@@ -301,11 +300,10 @@ The first scan can take a moment while the engine loads candles. The dashboard w
 
 | Method | Endpoint | Description |
 | --- | --- | --- |
-| `GET` | `/api/signals` | Full dashboard payload: signals, market, account, trades, withdrawals. |
+| `GET` | `/api/signals` | Full dashboard payload: signals, market, account, and trades. |
 | `POST` | `/api/signals/scan` | Trigger an immediate scan. |
 | `POST` | `/api/account/add-balance` | Add simulated balance. |
 | `POST` | `/api/account/lot-size` | Update the strategy lot size. |
-| `POST` | `/api/account/withdraw` | Submit a simulated withdrawal request. |
 
 All state-changing routes are same-origin guarded and rate-limited to 30 requests per minute per client.
 
@@ -343,8 +341,7 @@ Never expose your OANDA API token in the browser, screenshots, issues, or commit
 ## Important Limitations
 
 - This project is **not** a live trading system. It does not submit OANDA orders.
-- The account, deposits, withdrawals, and payouts are simulated.
-- Withdrawals are internal ledger entries; no payment gateway is connected.
+- The account and deposits are simulated.
 - The local JSON state file is suitable for a single-instance demo, not a horizontally scaled production deployment.
 - The included Express + Vite setup expects a persistent Node.js process.
 - Market data availability and rate limits depend on your OANDA account.
