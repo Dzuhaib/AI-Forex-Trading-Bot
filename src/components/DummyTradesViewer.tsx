@@ -729,9 +729,7 @@ export const DummyTradesViewer: React.FC = () => {
   const [showWithdraw, setShowWithdraw] = useState(false);
   const [receipt, setReceipt] = useState<Withdrawal | null>(null);
   const [balanceInput, setBalanceInput] = useState('');
-  const [lotInput, setLotInput] = useState('0.02');
-  const [lotFocused, setLotFocused] = useState(false);
-  const [settingsBusy, setSettingsBusy] = useState<'balance' | 'lot' | null>(null);
+  const [settingsBusy, setSettingsBusy] = useState<'balance' | null>(null);
   const [settingsNotice, setSettingsNotice] = useState<{
     tone: 'success' | 'error';
     text: string;
@@ -771,14 +769,6 @@ export const DummyTradesViewer: React.FC = () => {
         .sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0)),
     [trades]
   );
-  const accountLotSize = account?.lotSize;
-
-  useEffect(() => {
-    if (!lotFocused && accountLotSize && accountLotSize > 0) {
-      setLotInput(accountLotSize.toFixed(2));
-    }
-  }, [accountLotSize, lotFocused]);
-
   const handleAddBalance = async (event: React.FormEvent) => {
     event.preventDefault();
     const amount = Number(balanceInput);
@@ -809,41 +799,6 @@ export const DummyTradesViewer: React.FC = () => {
     }
   };
 
-  const handleUpdateLotSize = async (event: React.FormEvent) => {
-    event.preventDefault();
-    const next = Number(lotInput);
-    if (!Number.isFinite(next) || next < 0.01 || next > 100) {
-      setSettingsNotice({
-        tone: 'error',
-        text: 'Choose a lot size between 0.01 and 100.00.',
-      });
-      return;
-    }
-    setSettingsBusy('lot');
-    setSettingsNotice(null);
-    try {
-      const result = await postJson<{ lotSize: number; updatedTrades: number }>(
-        '/api/account/lot-size',
-        { lotSize: next }
-      );
-      setLotInput(result.lotSize.toFixed(2));
-      setSettingsNotice({
-        tone: 'success',
-        text: `Lot size ${result.lotSize.toFixed(2)}. ${result.updatedTrades} open trade${
-          result.updatedTrades === 1 ? '' : 's'
-        } updated.`,
-      });
-      await load();
-    } catch (err) {
-      setSettingsNotice({
-        tone: 'error',
-        text: err instanceof Error ? err.message : 'Lot size could not be updated.',
-      });
-    } finally {
-      setSettingsBusy(null);
-    }
-  };
-
   return (
     <div className="space-y-6 sm:space-y-8">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
@@ -856,7 +811,7 @@ export const DummyTradesViewer: React.FC = () => {
             Trades
           </h1>
           <p className="mt-1.5 text-[13px] text-[#6e6e73]">
-            {account?.lotSize.toFixed(2) ?? '0.02'} lot · 3% balance risk · 1:2 RR
+            Auto lot · {account?.riskPercent ?? 5}% balance risk · 40p SL · 80p TP
           </p>
         </div>
         <div className="grid grid-cols-2 gap-2 sm:flex">
@@ -936,45 +891,45 @@ export const DummyTradesViewer: React.FC = () => {
           </div>
         </form>
 
-        <form
-          onSubmit={(event) => void handleUpdateLotSize(event)}
-          className="rounded-2xl border border-black/[0.06] bg-white p-4 sm:p-5"
-        >
+        <div className="rounded-2xl border border-black/[0.06] bg-white p-4 sm:p-5">
           <div className="flex items-center gap-2">
             <span className="flex h-7 w-7 items-center justify-center rounded-full bg-[#f5f5f7] text-[#1d1d1f]">
               <SlidersHorizontal className="h-3.5 w-3.5" strokeWidth={2} />
             </span>
             <h2 className="text-[15px] font-semibold tracking-[-0.01em] text-[#1d1d1f]">
-              Lot size
+              Position sizing
             </h2>
           </div>
           <p className="mt-2 text-[11px] leading-5 text-[#86868b] sm:text-[12px]">
-            Applies to open and new trades.
+            Automatic from the current balance. Minimum 0.01 lot.
           </p>
-          <div className="mt-3 flex flex-col gap-2 sm:flex-row">
-            <input
-              aria-label="Strategy lot size"
-              value={lotInput}
-              onChange={(event) => setLotInput(event.target.value)}
-              onFocus={() => setLotFocused(true)}
-              onBlur={() => setLotFocused(false)}
-              type="number"
-              min="0.01"
-              max="100"
-              step="0.01"
-              disabled={!account || settingsBusy !== null}
-              className="h-[42px] flex-1 rounded-xl border border-transparent bg-[#f5f5f7] px-3.5 text-[16px] tabular-nums text-[#1d1d1f] focus:border-[#0071e3] focus:bg-white focus:outline-none disabled:opacity-50 sm:text-[14px]"
-            />
-            <button
-              type="submit"
-              disabled={!account || settingsBusy !== null}
-              className="inline-flex h-[42px] w-full items-center justify-center gap-2 rounded-xl bg-[#1d1d1f] px-5 text-[13px] font-medium text-white active:opacity-70 disabled:opacity-40 sm:w-auto"
-            >
-              {settingsBusy === 'lot' && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-              Update
-            </button>
+          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <div className="rounded-xl bg-[#f5f5f7] px-3 py-2">
+              <div className="text-[9px] uppercase tracking-[0.06em] text-[#86868b]">Risk</div>
+              <div className="mt-0.5 text-[13px] font-semibold tabular-nums text-[#1d1d1f]">
+                {account?.riskPercent ?? 5}%
+              </div>
+            </div>
+            <div className="rounded-xl bg-[#f5f5f7] px-3 py-2">
+              <div className="text-[9px] uppercase tracking-[0.06em] text-[#86868b]">SL</div>
+              <div className="mt-0.5 text-[13px] font-semibold tabular-nums text-[#1d1d1f]">
+                {account?.stopPips ?? 40}p
+              </div>
+            </div>
+            <div className="rounded-xl bg-[#f5f5f7] px-3 py-2">
+              <div className="text-[9px] uppercase tracking-[0.06em] text-[#86868b]">TP</div>
+              <div className="mt-0.5 text-[13px] font-semibold tabular-nums text-[#1d1d1f]">
+                {account?.takeProfitPips ?? 80}p
+              </div>
+            </div>
+            <div className="rounded-xl bg-[#f5f5f7] px-3 py-2">
+              <div className="text-[9px] uppercase tracking-[0.06em] text-[#86868b]">RR</div>
+              <div className="mt-0.5 text-[13px] font-semibold tabular-nums text-[#1d1d1f]">
+                1:2
+              </div>
+            </div>
           </div>
-        </form>
+        </div>
       </section>
 
       {settingsNotice && (

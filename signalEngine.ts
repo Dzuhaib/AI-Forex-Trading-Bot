@@ -1,9 +1,9 @@
 /**
  * Server-side live signal engine for the Untested H1/M30 High-Volume Body + M1 Reversal strategy.
  * - Scans OANDA FX/CFD instruments (FX majors + crosses, gold, WTI, BTC).
- * - Risks 3% of the current account balance per trade with a 2:1 reward-to-risk target.
+ * - Targets 5% of the current account balance per trade with fixed 40-pip SL and 80-pip TP.
  * - Watches every open signal against live M1 and S5 candles.
- * - Simulates a configurable account with a global lot size per signal.
+ * - Sizes each simulated trade from account risk, pip value, and the 0.01 lot minimum.
  * - Persists signals, trades and outcomes so restarts keep history.
  */
 
@@ -137,11 +137,12 @@ const TOUCH_TOLERANCE_PCT = 0.08;
 const HTF_CACHE_MS = 90_000;
 const MAX_RESOLVED_HISTORY = 400;
 const STARTING_BALANCE = 100;
-const DUMMY_LOT_SIZE = 0.02;
 const MIN_LOT_SIZE = 0.01;
 const MAX_LOT_SIZE = 100;
-const RISK_PERCENT = 3;
-const REWARD_RISK_RATIO = 2;
+const LOT_STEP = 0.01;
+const RISK_PERCENT = 5;
+const STOP_LOSS_PIPS = 40;
+const TAKE_PROFIT_PIPS = 80;
 const MAX_TRADE_HISTORY = 500;
 const ACCOUNT_CURRENCY = 'USD';
 
@@ -162,8 +163,30 @@ const CONTRACT_UNITS: Record<string, number> = {
   XTIUSD: 1_000,
 };
 
+const PIP_SIZE: Record<string, number> = {
+  XAUUSD: 0.1,
+  EURUSD: 0.0001,
+  GBPUSD: 0.0001,
+  AUDUSD: 0.0001,
+  NZDUSD: 0.0001,
+  USDJPY: 0.01,
+  EURJPY: 0.01,
+  GBPJPY: 0.01,
+  USDCHF: 0.0001,
+  GBPCHF: 0.0001,
+  AUDCHF: 0.0001,
+  AUDCAD: 0.0001,
+  BTCUSD: 1,
+  XTIUSD: 0.01,
+};
+
 function roundMoney(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+function roundLot(value: number): number {
+  const stepped = Math.round((value + Number.EPSILON) / LOT_STEP) * LOT_STEP;
+  return Math.min(MAX_LOT_SIZE, Math.max(MIN_LOT_SIZE, Number(stepped.toFixed(2))));
 }
 
 interface QuoteRates {
@@ -183,6 +206,13 @@ function quoteRate(symbol: string, rates: QuoteRates): number {
   if (symbol.endsWith('CHF')) return rates.USDCHF;
   if (symbol.endsWith('CAD')) return rates.USDCAD;
   return 1;
+}
+
+function pipValueUsd(symbol: string, rates: QuoteRates): number {
+  const pip = PIP_SIZE[symbol] ?? 0.0001;
+  const units = CONTRACT_UNITS[symbol] ?? 1;
+  const rate = quoteRate(symbol, rates);
+  return rate > 0 ? (pip * units) / rate : 0;
 }
 
 function tradePnl(
@@ -450,7 +480,6 @@ export class SignalEngine {
   private stats: EngineStats = { total: 0, tp: 0, sl: 0, ambiguous: 0, expired: 0 };
   private startingBalance = STARTING_BALANCE;
   private balance = STARTING_BALANCE;
-  private lotSize = DUMMY_LOT_SIZE;
   private trades = new Map<string, DummyTrade>();
   private withdrawals: Withdrawal[] = [];
   private symbols: string[] = [];
@@ -581,57 +610,6 @@ export class SignalEngine {
     return { ok: true, balance: this.balance, startingBalance: this.startingBalance };
   }
 
-  updateLotSize(input: { lotSize?: unknown }):
-    | { ok: true; lotSize: number; updatedTrades: number }
-    | { ok: false; error: string } {
-    const raw = Number(input.lotSize);
-    if (!Number.isFinite(raw) || raw < MIN_LOT_SIZE || raw > MAX_LOT_SIZE) {
-      return {
-        ok: false,
-        error: `Choose a lot size between ${MIN_LOT_SIZE.toFixed(2)} and ${MAX_LOT_SIZE.toFixed(2)}.`,
-      };
-    }
-    const next = Math.round(raw * 100) / 100;
-    this.lotSize = next;
-    let updatedTrades = 0;
-
-    for (const trade of this.trades.values()) {
-      if (trade.status !== 'OPEN') continue;
-      const targets = this.riskTargets(trade.symbol);
-      if (!targets) continue;
-      trade.lotSize = next;
-      trade.stopLoss =
-        trade.direction === 'LONG'
-          ? trade.entryPrice - targets.slDistance
-          : trade.entryPrice + targets.slDistance;
-      trade.takeProfit =
-        trade.direction === 'LONG'
-          ? trade.entryPrice + targets.tpDistance
-          : trade.entryPrice - targets.tpDistance;
-      updatedTrades += 1;
-    }
-
-    for (const signal of this.signals.values()) {
-      if (signal.status !== 'OPEN') continue;
-      const targets = this.riskTargets(signal.symbol);
-      if (!targets) continue;
-      signal.stopLoss =
-        signal.direction === 'LONG'
-          ? signal.entry - targets.slDistance
-          : signal.entry + targets.slDistance;
-      signal.takeProfit =
-        signal.direction === 'LONG'
-          ? signal.entry + targets.tpDistance
-          : signal.entry - targets.tpDistance;
-      signal.riskPct = Number(((targets.slDistance / signal.entry) * 100).toFixed(3));
-      signal.rewardPct = Number(((targets.tpDistance / signal.entry) * 100).toFixed(3));
-      signal.roePct = Number((signal.rewardPct * signal.leverage).toFixed(2));
-    }
-
-    this.saveState();
-    return { ok: true, lotSize: this.lotSize, updatedTrades };
-  }
-
   private quoteRates(): QuoteRates {
     const usdjpy = this.marketPrices.get('USDJPY');
     const usdchf = this.marketPrices.get('USDCHF');
@@ -646,22 +624,31 @@ export class SignalEngine {
     };
   }
 
-  private priceDistanceForUsd(symbol: string, usd: number): number {
-    const units = (CONTRACT_UNITS[symbol] ?? 1) * this.lotSize;
-    if (units <= 0) return 0;
-    return (usd * quoteRate(symbol, this.quoteRates())) / units;
-  }
-
   private riskTargets(symbol: string):
-    | { riskUsd: number; rewardUsd: number; slDistance: number; tpDistance: number }
+    | {
+        riskUsd: number;
+        rewardUsd: number;
+        slDistance: number;
+        tpDistance: number;
+        lotSize: number;
+      }
     | null {
+    const pip = PIP_SIZE[symbol];
+    if (!(pip > 0)) return null;
     const riskUsd = roundMoney(this.balance * (RISK_PERCENT / 100));
     if (!(riskUsd > 0)) return null;
-    const rewardUsd = roundMoney(riskUsd * REWARD_RISK_RATIO);
-    const slDistance = this.priceDistanceForUsd(symbol, riskUsd);
-    const tpDistance = this.priceDistanceForUsd(symbol, rewardUsd);
-    if (!(slDistance > 0) || !(tpDistance > 0)) return null;
-    return { riskUsd, rewardUsd, slDistance, tpDistance };
+    const pipValue = pipValueUsd(symbol, this.quoteRates());
+    if (!(pipValue > 0)) return null;
+    const lotSize = roundLot(riskUsd / (STOP_LOSS_PIPS * pipValue));
+    const actualRiskUsd = roundMoney(STOP_LOSS_PIPS * pipValue * lotSize);
+    const actualRewardUsd = roundMoney(actualRiskUsd * (TAKE_PROFIT_PIPS / STOP_LOSS_PIPS));
+    return {
+      riskUsd,
+      rewardUsd: actualRewardUsd,
+      slDistance: STOP_LOSS_PIPS * pip,
+      tpDistance: TAKE_PROFIT_PIPS * pip,
+      lotSize,
+    };
   }
 
   getResponse(): SignalsResponse {
@@ -761,8 +748,10 @@ export class SignalEngine {
       realizedPnl: roundMoney(this.balance - this.startingBalance + withdrawnTotal),
       withdrawnTotal,
       openTrades: trades.filter((trade) => trade.status === 'OPEN').length,
-    closedTrades: trades.filter((trade) => trade.status === 'CLOSED').length,
-    lotSize: this.lotSize,
+      closedTrades: trades.filter((trade) => trade.status === 'CLOSED').length,
+      riskPercent: RISK_PERCENT,
+      stopPips: STOP_LOSS_PIPS,
+      takeProfitPips: TAKE_PROFIT_PIPS,
       currency: ACCOUNT_CURRENCY,
     };
 
@@ -873,7 +862,7 @@ export class SignalEngine {
       signal.roePct = Number((signal.rewardPct * signal.leverage).toFixed(2));
       const trade = this.trades.get(signal.id);
       if (trade && trade.status === 'OPEN') {
-        trade.lotSize = this.lotSize;
+        trade.lotSize = targets.lotSize;
         trade.stopLoss = signal.stopLoss;
         trade.takeProfit = signal.takeProfit;
       }
@@ -1158,13 +1147,14 @@ export class SignalEngine {
 
   private openDummyTrade(signal: TrackedSignal): void {
     if (this.trades.has(signal.id)) return;
+    const targets = this.riskTargets(signal.symbol);
     this.trades.set(signal.id, {
       id: signal.id,
       signalId: signal.id,
       symbol: signal.symbol,
-    direction: signal.direction,
-    lotSize: this.lotSize,
-    entryPrice: signal.entry,
+      direction: signal.direction,
+      lotSize: targets?.lotSize ?? MIN_LOT_SIZE,
+      entryPrice: signal.entry,
       stopLoss: signal.stopLoss,
       takeProfit: signal.takeProfit,
       openedAt: signal.signalTime,
@@ -1526,7 +1516,6 @@ export class SignalEngine {
         stats: this.stats,
         startingBalance: this.startingBalance,
         balance: this.balance,
-        lotSize: this.lotSize,
         signals: [...this.signals.values()],
         trades: [...this.trades.values()],
         withdrawals: this.withdrawals,
@@ -1552,7 +1541,6 @@ export class SignalEngine {
         stats?: Partial<EngineStats>;
         startingBalance?: number;
         balance?: number;
-        lotSize?: number;
       };
       if (raw.dataSource !== 'oanda') {
         this.signals.clear();
@@ -1569,14 +1557,6 @@ export class SignalEngine {
       }
       const storedBalance = Number(raw.balance);
       this.balance = Number.isFinite(storedBalance) ? storedBalance : this.startingBalance;
-      const storedLotSize = Number(raw.lotSize);
-      if (
-        Number.isFinite(storedLotSize) &&
-        storedLotSize >= MIN_LOT_SIZE &&
-        storedLotSize <= MAX_LOT_SIZE
-      ) {
-        this.lotSize = Math.round(storedLotSize * 100) / 100;
-      }
       if (Array.isArray(raw.trades)) {
         for (const item of raw.trades) {
           const trade = this.normalizeStoredTrade(item);
@@ -1584,9 +1564,6 @@ export class SignalEngine {
           if (trade.status === 'OPEN' && !SYMBOL_INSTRUMENTS[trade.symbol]) continue;
           this.trades.set(trade.id, trade);
         }
-      }
-      for (const trade of this.trades.values()) {
-        if (trade.status === 'OPEN') trade.lotSize = this.lotSize;
       }
       if (Array.isArray(raw.withdrawals)) {
         for (const item of raw.withdrawals) {
@@ -1712,7 +1689,7 @@ export class SignalEngine {
       signalId: String(raw.signalId ?? id),
       symbol,
       direction,
-        lotSize: Number.isFinite(lotSize) && lotSize > 0 ? lotSize : this.lotSize,
+      lotSize: Number.isFinite(lotSize) && lotSize > 0 ? lotSize : MIN_LOT_SIZE,
       entryPrice,
       stopLoss: Number(raw.stopLoss ?? 0),
       takeProfit: Number(raw.takeProfit ?? 0),

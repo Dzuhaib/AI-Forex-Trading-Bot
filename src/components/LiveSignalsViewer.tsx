@@ -541,7 +541,7 @@ export const LiveSignalsViewer: React.FC = () => {
             Live Signals
           </h1>
           <p className="mt-1.5 text-[13px] leading-5 text-[#6e6e73]">
-            Forex and CFD signals. 3% balance risk · 1:2 RR.
+            Forex and CFD signals. 5% balance risk · 40p SL · 80p TP.
           </p>
         </div>
         <div className="grid grid-cols-2 gap-2 sm:flex">
@@ -573,7 +573,7 @@ export const LiveSignalsViewer: React.FC = () => {
                 Account
               </h2>
               <span className="text-[11px] text-[#86868b]">
-                {data.account.lotSize.toFixed(2)} lot
+                {data.account.riskPercent}% risk · {data.account.stopPips}p SL
               </span>
             </div>
             <span className="text-[11px] text-[#86868b]">

@@ -20,7 +20,7 @@ Signals · Risk management · Live analytics · Trade journal · Account simulat
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-4-06B6D4?style=for-the-badge&logo=tailwindcss&logoColor=white)](https://tailwindcss.com/)
 
 [![OANDA](https://img.shields.io/badge/OANDA-v20-00A3E0?style=for-the-badge)](https://developer.oanda.com/)
-[![Risk](https://img.shields.io/badge/risk-3%25%20of%20balance-FF3B30?style=for-the-badge)](#risk-model)
+[![Risk](https://img.shields.io/badge/risk-5%25%20of%20balance-FF3B30?style=for-the-badge)](#risk-model)
 [![Reward](https://img.shields.io/badge/reward-1%3A2%20RR-34C759?style=for-the-badge)](#risk-model)
 [![Mode](https://img.shields.io/badge/mode-simulated%20trading-0071E3?style=for-the-badge)](#important-limitations)
 
@@ -46,8 +46,8 @@ The app combines a real-time signal engine with a polished React interface, a si
 
 Most signal dashboards stop at a marker on a chart. This project focuses on the full workflow:
 
-- **Risk-defined signals** — every trade risks exactly **3% of the current account balance**.
-- **Fixed 2R targets** — take profit is always **2x the stop distance**.
+- **Risk-defined signals** — every trade targets **5% of the current account balance**.
+- **Fixed 40/80 pip levels** — stop loss is **40 pips**, take profit is **80 pips**.
 - **Live market context** — current price, entry, stop, target, R multiple, and progress.
 - **A visual trade state** — each open signal includes a compact SL-vs-TP tug-of-war scene with the live market marker and entry point.
 - **A simulated account** — realized PnL, floating PnL, equity, deposits, and trade history.
@@ -70,11 +70,12 @@ Most signal dashboards stop at a marker on a chart. This project focuses on the 
 
 ### Risk model
 
-- **Risk per trade:** 3% of the current simulated account balance.
-- **Reward target:** 6% of the balance at entry, before fees and slippage.
+- **Risk per trade:** 5% of the current simulated account balance.
+- **Stop loss:** fixed **40 pips** per instrument.
+- **Take profit:** fixed **80 pips** per instrument.
 - **Risk-to-reward ratio:** exactly **1:2**.
-- SL and TP distances are calculated per instrument using contract size and USD quote conversion.
-- Lot size controls the price distance required to reach the 3% risk amount.
+- Position size is calculated from account risk, instrument pip size, contract units, and USD quote conversion.
+- Lots round to the **0.01 lot step**, with a **0.01 minimum**, so actual risk can vary slightly.
 - Open positions are re-targeted to the active risk model when the engine starts.
 
 ### Dashboard
@@ -86,7 +87,7 @@ Most signal dashboards stop at a marker on a chart. This project focuses on the 
 - Market watch strip with current prices and 24-hour context.
 - Account summary with balance, equity, realized PnL, floating PnL, and open trade count.
 - Trade history with entry, stop, target, exit, lot size, and outcome.
-- Balance deposits and lot-size controls.
+- Automatic per-trade position sizing and balance deposits.
 
 ### Engineering
 
@@ -134,7 +135,7 @@ M1 reversal candle + volume confirmation
 Duplicate and cooldown checks
       │
       ▼
-3% balance risk + 2R target calculation
+5% balance risk + 40/80 pip sizing
       │
       ▼
 Simulated trade opened
@@ -163,11 +164,13 @@ The engine looks for a reversal candle touching an untested zone. Long setups re
 When a signal is accepted:
 
 ```text
-riskUsd   = account balance × 3%
-rewardUsd = riskUsd × 2
+riskUsd = account balance × 5%
+slDistance = 40 × pip size
+tpDistance = 80 × pip size
+lotSize = riskUsd / (40 × pip value per lot)
 ```
 
-The engine converts those USD amounts into instrument-specific price distances using the configured lot size, contract units, and quote conversion. Stop loss and take profit are then placed symmetrically around the entry, with TP at twice the stop distance.
+The engine converts the fixed pip distances into instrument prices using each symbol's pip size. Position size is derived from the 5% risk target, contract units, and USD quote conversion, then rounded to the 0.01 lot step. Stop loss and take profit are placed symmetrically around the entry, with TP at twice the stop distance.
 
 ### 5. Trade lifecycle
 
@@ -303,7 +306,6 @@ The first scan can take a moment while the engine loads candles. The dashboard w
 | `GET` | `/api/signals` | Full dashboard payload: signals, market, account, and trades. |
 | `POST` | `/api/signals/scan` | Trigger an immediate scan. |
 | `POST` | `/api/account/add-balance` | Add simulated balance. |
-| `POST` | `/api/account/lot-size` | Update the strategy lot size. |
 
 All state-changing routes are same-origin guarded and rate-limited to 30 requests per minute per client.
 
@@ -313,13 +315,14 @@ All state-changing routes are same-origin guarded and rate-limited to 30 request
 
 The engine is intentionally explicit about risk:
 
-- **Account risk:** 3% of the current simulated balance at signal creation.
-- **Target:** 2R, equal to 6% of the balance at entry.
-- **Stop distance:** derived from the risk amount and selected lot size.
-- **Take-profit distance:** exactly twice the stop distance.
+- **Account risk:** 5% of the current simulated balance at signal creation.
+- **Stop distance:** fixed 40 pips for every instrument.
+- **Take-profit distance:** fixed 80 pips for every instrument.
+- **Risk-to-reward:** exactly 1:2.
+- **Position size:** calculated automatically and rounded to the nearest 0.01 lot, with a 0.01 minimum.
 - **Balance model:** the simulated balance excludes floating PnL; equity includes it.
 
-The lot-size control changes the price distance used to express the same 3% risk. A larger lot produces a tighter stop; a smaller lot produces a wider stop. This keeps the monetary risk defined by the account balance rather than by a fixed dollar target.
+Because lots round to 0.01, the actual risk can be slightly above or below 5%. For example, a 40-pip stop on XAUUSD at a $96.03 balance needs 0.012 lots for an exact 5% risk; the 0.01 lot step uses either 0.01 lot (4.17%) or 0.02 lot (8.33%). The engine uses the nearest available lot.
 
 ---
 

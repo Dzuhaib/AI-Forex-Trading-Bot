@@ -87,7 +87,9 @@ export interface AccountSummary {
   withdrawnTotal: number;
   openTrades: number;
   closedTrades: number;
-  lotSize: number;
+  riskPercent: number;
+  stopPips: number;
+  takeProfitPips: number;
   currency: string;
 }
 

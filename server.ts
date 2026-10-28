@@ -104,15 +104,6 @@ async function startServer() {
     res.json(result);
   });
 
-  app.post('/api/account/lot-size', (req, res) => {
-    const result = signalEngine.updateLotSize((req.body ?? {}) as Record<string, unknown>);
-    if (!result.ok) {
-      res.status(400).json({ error: result.error });
-      return;
-    }
-    res.json(result);
-  });
-
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
