@@ -2,7 +2,7 @@
   "name": "forex-trading-bot",
   "private": true,
   "version": "0.0.0",
-  "description": "Forex signal engine with live OANDA data, 5% risk sizing, fixed 40/80 pip targets, and a simulated trading dashboard.",
+  "description": "Forex signal engine with live OANDA data, 5% risk sizing, per-instrument 2R targets, and a simulated trading dashboard.",
   "type": "module",
   "homepage": "https://github.com/Dzuhaib/AI-Forex-Trading-Bot#readme",
   "repository": {

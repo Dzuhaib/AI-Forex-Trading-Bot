@@ -1,5 +1,11 @@
 export type SignalDirection = 'LONG' | 'SHORT';
-export type SignalStatus = 'OPEN' | 'TP_HIT' | 'SL_HIT' | 'AMBIGUOUS' | 'EXPIRED';
+export type SignalStatus =
+  | 'OPEN'
+  | 'TP_HIT'
+  | 'SL_HIT'
+  | 'BREAKEVEN_HIT'
+  | 'AMBIGUOUS'
+  | 'EXPIRED';
 
 export interface LiveSignal {
   id: string;
@@ -15,6 +21,7 @@ export interface LiveSignal {
   entry: number;
   stopLoss: number;
   takeProfit: number;
+  initialRiskDistance: number;
   riskPct: number;
   rewardPct: number;
   roePct: number;
@@ -88,8 +95,6 @@ export interface AccountSummary {
   openTrades: number;
   closedTrades: number;
   riskPercent: number;
-  stopPips: number;
-  takeProfitPips: number;
   currency: string;
 }
 
@@ -127,6 +132,7 @@ export interface SignalEngineStatus {
   totalSignals: number;
   tp: number;
   sl: number;
+  breakeven: number;
   ambiguous: number;
   expired: number;
   winRatePct: number;

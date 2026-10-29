@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   Clock,
   Crosshair,
+  MinusCircle,
   RefreshCw,
   TrendingDown,
   TrendingUp,
@@ -24,12 +25,13 @@ import type {
 } from '../types';
 import { MiniTugOfWar } from './MiniTugOfWar';
 
-type SignalFilter = 'ALL' | 'OPEN' | 'TP' | 'SL' | 'OTHER';
+type SignalFilter = 'ALL' | 'OPEN' | 'TP' | 'SL' | 'BE' | 'OTHER';
 
 const STATUS_META: Record<SignalStatus, { label: string; text: string; dot: string }> = {
   OPEN: { label: 'Live', text: 'text-[#0071e3]', dot: 'bg-[#0071e3]' },
   TP_HIT: { label: 'TP hit', text: 'text-[#1d8f3a]', dot: 'bg-[#34c759]' },
   SL_HIT: { label: 'SL hit', text: 'text-[#d70015]', dot: 'bg-[#ff3b30]' },
+  BREAKEVEN_HIT: { label: 'Breakeven hit', text: 'text-[#6e56cf]', dot: 'bg-[#af52de]' },
   AMBIGUOUS: { label: 'Ambiguous', text: 'text-[#a05a00]', dot: 'bg-[#ff9f0a]' },
   EXPIRED: { label: 'Expired', text: 'text-[#86868b]', dot: 'bg-[#aeaeb2]' },
 };
@@ -102,7 +104,10 @@ function directionClass(direction: 'LONG' | 'SHORT'): string {
 
 function signalR(signal: LiveSignal): number {
   if (signal.status === 'OPEN') return signal.unrealizedR;
-  const risk = Math.abs(signal.entry - signal.stopLoss);
+  const risk =
+    signal.initialRiskDistance > 0
+      ? signal.initialRiskDistance
+      : Math.abs(signal.entry - signal.stopLoss);
   if (!risk) return 0;
   const direction = signal.direction === 'LONG' ? 1 : -1;
   const exit = signal.resolutionPrice ?? signal.livePrice ?? signal.entry;
@@ -503,7 +508,8 @@ export const LiveSignalsViewer: React.FC = () => {
     if (filter === 'OPEN') return signals.filter((signal) => signal.status === 'OPEN');
     if (filter === 'TP') return signals.filter((signal) => signal.status === 'TP_HIT');
     if (filter === 'SL') return signals.filter((signal) => signal.status === 'SL_HIT');
-    return signals.filter((signal) => !['OPEN', 'TP_HIT', 'SL_HIT'].includes(signal.status));
+    if (filter === 'BE') return signals.filter((signal) => signal.status === 'BREAKEVEN_HIT');
+    return signals.filter((signal) => ['AMBIGUOUS', 'EXPIRED'].includes(signal.status));
   }, [filter, signals]);
 
   const tapeTotals = useMemo(
@@ -511,6 +517,7 @@ export const LiveSignalsViewer: React.FC = () => {
       total: signals.length,
       tp: signals.filter((signal) => signal.status === 'TP_HIT').length,
       sl: signals.filter((signal) => signal.status === 'SL_HIT').length,
+      breakeven: signals.filter((signal) => signal.status === 'BREAKEVEN_HIT').length,
       open: signals.filter((signal) => signal.status === 'OPEN').length,
       ambiguous: signals.filter((signal) => signal.status === 'AMBIGUOUS').length,
       expired: signals.filter((signal) => signal.status === 'EXPIRED').length,
@@ -525,6 +532,7 @@ export const LiveSignalsViewer: React.FC = () => {
             total: status.totalSignals,
             tp: status.tp,
             sl: status.sl,
+            breakeven: status.breakeven ?? 0,
             open: status.openSignals,
             ambiguous: status.ambiguous,
             expired: status.expired,
@@ -541,7 +549,7 @@ export const LiveSignalsViewer: React.FC = () => {
             Live Signals
           </h1>
           <p className="mt-1.5 text-[13px] leading-5 text-[#6e6e73]">
-            Forex and CFD signals. 5% balance risk · 40p SL · 80p TP.
+            Forex and CFD signals. 5% balance risk · per-pair SL · 2R TP.
           </p>
         </div>
         <div className="grid grid-cols-2 gap-2 sm:flex">
@@ -573,7 +581,7 @@ export const LiveSignalsViewer: React.FC = () => {
                 Account
               </h2>
               <span className="text-[11px] text-[#86868b]">
-                {data.account.riskPercent}% risk · {data.account.stopPips}p SL
+                {data.account.riskPercent}% risk · per-pair SL
               </span>
             </div>
             <span className="text-[11px] text-[#86868b]">
@@ -617,7 +625,7 @@ export const LiveSignalsViewer: React.FC = () => {
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 sm:gap-3 lg:grid-cols-6">
+      <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 sm:gap-3 lg:grid-cols-7">
         <StatCard
           label="Open"
           value={loading ? '—' : engineTotals.open}
@@ -634,6 +642,12 @@ export const LiveSignalsViewer: React.FC = () => {
           value={loading ? '—' : engineTotals.sl}
           accent={engineTotals.sl > 0 ? 'text-[#d70015]' : undefined}
           icon={<XCircle className="h-4 w-4" strokeWidth={1.7} />}
+        />
+        <StatCard
+          label="Breakeven"
+          value={loading ? '—' : engineTotals.breakeven}
+          accent={engineTotals.breakeven > 0 ? 'text-[#6e56cf]' : undefined}
+          icon={<MinusCircle className="h-4 w-4" strokeWidth={1.7} />}
         />
         <StatCard
           label="Win rate"
@@ -758,6 +772,7 @@ export const LiveSignalsViewer: React.FC = () => {
                 ['OPEN', `Open ${tapeTotals.open}`],
                 ['TP', `TP ${tapeTotals.tp}`],
                 ['SL', `SL ${tapeTotals.sl}`],
+                ['BE', `Breakeven ${tapeTotals.breakeven}`],
                 ['OTHER', `Other ${tapeTotals.ambiguous + tapeTotals.expired}`],
               ] as Array<[SignalFilter, string]>
             ).map(([value, label]) => (

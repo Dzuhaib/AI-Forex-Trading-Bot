@@ -1,9 +1,10 @@
 /**
  * Server-side live signal engine for the Untested H1/M30 High-Volume Body + M1 Reversal strategy.
  * - Scans OANDA FX/CFD instruments (FX majors + crosses, gold, WTI, BTC).
- * - Targets 5% of the current account balance per trade with fixed 40-pip SL and 80-pip TP.
+ * - Targets 5% of the current account balance per trade with a per-instrument SL and 2R TP.
  * - Watches every open signal against live M1 and S5 candles.
  * - Sizes each simulated trade from account risk, pip value, and the 0.01 lot minimum.
+ * - At 50% of TP, moves SL to a 20% TP profit lock and trails it 30% of TP behind the best price.
  * - Persists signals, trades and outcomes so restarts keep history.
  */
 
@@ -52,6 +53,9 @@ interface TrackedSignal extends LiveSignal {
   signalMinuteEnd: number;
   nextCandleOpen: number;
   intraDone: boolean;
+  initialRiskDistance: number;
+  bestPrice: number;
+  breakevenActive: boolean;
 }
 
 interface ScanResult {
@@ -141,8 +145,26 @@ const MIN_LOT_SIZE = 0.01;
 const MAX_LOT_SIZE = 100;
 const LOT_STEP = 0.01;
 const RISK_PERCENT = 5;
-const STOP_LOSS_PIPS = 40;
-const TAKE_PROFIT_PIPS = 80;
+const REWARD_RISK_RATIO = 2;
+const STOP_LOSS_DISTANCE: Record<string, number> = {
+  XAUUSD: 4,
+  EURUSD: 0.00027,
+  GBPUSD: 0.00027,
+  AUDUSD: 0.00027,
+  NZDUSD: 0.00027,
+  USDJPY: 0.035,
+  EURJPY: 0.035,
+  GBPJPY: 0.035,
+  USDCHF: 0.00027,
+  GBPCHF: 0.00027,
+  AUDCHF: 0.00027,
+  AUDCAD: 0.00027,
+  BTCUSD: 260,
+  XTIUSD: 0.4,
+};
+const BREAKEVEN_TRIGGER_PCT = 50;
+const BREAKEVEN_LOCK_PCT = 20;
+const TRAILING_GAP_PCT = 30;
 const MAX_TRADE_HISTORY = 500;
 const ACCOUNT_CURRENCY = 'USD';
 
@@ -248,6 +270,7 @@ interface EngineStats {
   total: number;
   tp: number;
   sl: number;
+  breakeven: number;
   ambiguous: number;
   expired: number;
 }
@@ -462,6 +485,8 @@ function verdictFor(status: SignalStatus): string {
       return 'FOLLOWED SIGNAL (TP HIT)';
     case 'SL_HIT':
       return 'WENT AGAINST SIGNAL (SL HIT)';
+    case 'BREAKEVEN_HIT':
+      return 'BREAKEVEN HIT (TRAILING STOP)';
     case 'AMBIGUOUS':
       return 'CHOPPY (TP + SL SAME CANDLE)';
     case 'EXPIRED':
@@ -477,7 +502,14 @@ export class SignalEngine {
   private readonly opts: EngineOptions;
   private signals = new Map<string, TrackedSignal>();
   private lastTriggerBySymbol = new Map<string, number>();
-  private stats: EngineStats = { total: 0, tp: 0, sl: 0, ambiguous: 0, expired: 0 };
+  private stats: EngineStats = {
+    total: 0,
+    tp: 0,
+    sl: 0,
+    breakeven: 0,
+    ambiguous: 0,
+    expired: 0,
+  };
   private startingBalance = STARTING_BALANCE;
   private balance = STARTING_BALANCE;
   private trades = new Map<string, DummyTrade>();
@@ -634,19 +666,22 @@ export class SignalEngine {
       }
     | null {
     const pip = PIP_SIZE[symbol];
-    if (!(pip > 0)) return null;
+    const slDistance = STOP_LOSS_DISTANCE[symbol];
+    if (!(pip > 0) || !(slDistance > 0)) return null;
     const riskUsd = roundMoney(this.balance * (RISK_PERCENT / 100));
     if (!(riskUsd > 0)) return null;
     const pipValue = pipValueUsd(symbol, this.quoteRates());
     if (!(pipValue > 0)) return null;
-    const lotSize = roundLot(riskUsd / (STOP_LOSS_PIPS * pipValue));
-    const actualRiskUsd = roundMoney(STOP_LOSS_PIPS * pipValue * lotSize);
-    const actualRewardUsd = roundMoney(actualRiskUsd * (TAKE_PROFIT_PIPS / STOP_LOSS_PIPS));
+    const slPips = slDistance / pip;
+    const lotSize = roundLot(riskUsd / (slPips * pipValue));
+    const actualRiskUsd = roundMoney(slPips * pipValue * lotSize);
+    const tpDistance = slDistance * REWARD_RISK_RATIO;
+    const actualRewardUsd = roundMoney(actualRiskUsd * REWARD_RISK_RATIO);
     return {
       riskUsd,
       rewardUsd: actualRewardUsd,
-      slDistance: STOP_LOSS_PIPS * pip,
-      tpDistance: TAKE_PROFIT_PIPS * pip,
+      slDistance,
+      tpDistance,
       lotSize,
     };
   }
@@ -656,10 +691,11 @@ export class SignalEngine {
     const all = [...this.signals.values()];
     const tp = this.stats.tp;
     const sl = this.stats.sl;
+    const breakeven = this.stats.breakeven;
     const ambiguous = this.stats.ambiguous;
     const expired = this.stats.expired;
     const open = all.filter((s) => s.status === 'OPEN').length;
-    const decided = tp + sl;
+    const decided = tp + sl + breakeven;
 
     const status: SignalEngineStatus = {
       running: this.running,
@@ -680,9 +716,10 @@ export class SignalEngine {
       totalSignals: this.stats.total,
       tp,
       sl,
+      breakeven,
       ambiguous,
       expired,
-      winRatePct: decided > 0 ? Number(((tp / decided) * 100).toFixed(2)) : 0,
+      winRatePct: decided > 0 ? Number((((tp + breakeven) / decided) * 100).toFixed(2)) : 0,
       symbolSource: this.symbolSource,
       lastError: this.lastError,
     };
@@ -750,8 +787,6 @@ export class SignalEngine {
       openTrades: trades.filter((trade) => trade.status === 'OPEN').length,
       closedTrades: trades.filter((trade) => trade.status === 'CLOSED').length,
       riskPercent: RISK_PERCENT,
-      stopPips: STOP_LOSS_PIPS,
-      takeProfitPips: TAKE_PROFIT_PIPS,
       currency: ACCOUNT_CURRENCY,
     };
 
@@ -849,10 +884,19 @@ export class SignalEngine {
       if (!SYMBOL_INSTRUMENTS[signal.symbol]) continue;
       const targets = this.riskTargets(signal.symbol);
       if (!targets) continue;
-      signal.stopLoss =
+      signal.initialRiskDistance = targets.slDistance;
+      const initialStop =
         signal.direction === 'LONG'
           ? signal.entry - targets.slDistance
           : signal.entry + targets.slDistance;
+      const trailingStop = signal.breakevenActive
+        ? this.trailingStopPrice(signal, targets.tpDistance)
+        : initialStop;
+      const activeStop = signal.breakevenActive ? signal.stopLoss : initialStop;
+      signal.stopLoss =
+        signal.direction === 'LONG'
+          ? Math.max(initialStop, activeStop, trailingStop)
+          : Math.min(initialStop, activeStop, trailingStop);
       signal.takeProfit =
         signal.direction === 'LONG'
           ? signal.entry + targets.tpDistance
@@ -949,8 +993,10 @@ export class SignalEngine {
       quoteVolume: lastDay.reduce((sum, candle) => sum + candle.volume, 0),
     });
     const m1AvgVol = averageVolume(m1, m1.length - 1 - M1_VOL_LOOKBACK, m1.length - 1);
-    const currentVolRatio = m1AvgVol > 0 ? currentCandle.volume / m1AvgVol : 1;
     const previousVolRatio = m1AvgVol > 0 ? previousCandle.volume / m1AvgVol : 1;
+    const startupCutoffMs = Math.ceil(this.startedAt / 60_000) * 60_000;
+    const confirmationCandles: Array<[Kline, number]> =
+      previousCandle.openTime >= startupCutoffMs ? [[previousCandle, previousVolRatio]] : [];
 
     const zones = [
       ...findUntestedHtfBodyZones(h1, 'H1', price),
@@ -976,16 +1022,13 @@ export class SignalEngine {
 
     let triggeredZone: Zone | null = null;
     let direction: SignalDirection | null = null;
-    let triggerRatio = currentVolRatio;
-    let triggerCandle = currentCandle;
+    let triggerRatio = previousVolRatio;
+    let triggerCandle = previousCandle;
 
     for (const zone of demandZones) {
       const upper = zone.bodyTop * (1 + tolerance);
       const lower = zone.bodyBottom * (1 - tolerance * 2);
-      for (const [candle, ratio] of [
-        [currentCandle, currentVolRatio],
-        [previousCandle, previousVolRatio],
-      ] as Array<[Kline, number]>) {
+      for (const [candle, ratio] of confirmationCandles) {
         const touched = candle.low <= upper && candle.high >= lower;
         const isGreen = candle.close > candle.open && candle.close >= zone.bodyBottom;
         if (touched && isGreen && ratio >= M1_VOL_MULTIPLIER) {
@@ -1003,10 +1046,7 @@ export class SignalEngine {
       for (const zone of supplyZones) {
         const lower = zone.bodyBottom * (1 - tolerance);
         const upper = zone.bodyTop * (1 + tolerance * 2);
-        for (const [candle, ratio] of [
-          [currentCandle, currentVolRatio],
-          [previousCandle, previousVolRatio],
-        ] as Array<[Kline, number]>) {
+        for (const [candle, ratio] of confirmationCandles) {
           const touched = candle.high >= lower && candle.low <= upper;
           const isRed = candle.close < candle.open && candle.close <= zone.bodyTop;
           if (touched && isRed && ratio >= M1_VOL_MULTIPLIER) {
@@ -1135,6 +1175,9 @@ export class SignalEngine {
       signalMinuteEnd,
       nextCandleOpen: signalMinuteEnd,
       intraDone: false,
+      initialRiskDistance: Math.abs(signal.entry - signal.stopLoss),
+      bestPrice: signal.entry,
+      breakevenActive: false,
     };
 
     this.lastTriggerBySymbol.set(signal.symbol, signal.triggerCandleOpen);
@@ -1286,11 +1329,20 @@ export class SignalEngine {
               break;
             }
             if (hit.slHit) {
-              this.resolveSignal(signal, 'SL_HIT', signal.stopLoss, closed ? candle.closeTime : now);
+              this.resolveSignal(
+                signal,
+                this.stopHitStatus(signal),
+                signal.stopLoss,
+                closed ? candle.closeTime : now
+              );
               break;
             }
             this.resolveSignal(signal, 'TP_HIT', signal.takeProfit, closed ? candle.closeTime : now);
             break;
+          }
+
+          if (closed) {
+            this.updateTrailingStop(signal, candle);
           }
 
           signal.livePrice = candle.close;
@@ -1335,12 +1387,15 @@ export class SignalEngine {
             break;
           }
           if (hit.slHit) {
-            this.resolveSignal(signal, 'SL_HIT', signal.stopLoss, candle.closeTime);
+            this.resolveSignal(signal, this.stopHitStatus(signal), signal.stopLoss, candle.closeTime);
             break;
           }
           if (hit.tpHit) {
             this.resolveSignal(signal, 'TP_HIT', signal.takeProfit, candle.closeTime);
             break;
+          }
+          if (candle.closeTime <= now) {
+            this.updateTrailingStop(signal, candle);
           }
           signal.livePrice = candle.close;
           signal.liveUpdatedAt = now;
@@ -1351,7 +1406,7 @@ export class SignalEngine {
   }
 
   private applyExtremes(signal: TrackedSignal, candle: Kline): void {
-    const risk = Math.abs(signal.entry - signal.stopLoss);
+    const risk = signal.initialRiskDistance;
     if (risk <= 0) return;
     const favourable =
       signal.direction === 'LONG' ? candle.high - signal.entry : signal.entry - candle.low;
@@ -1359,6 +1414,66 @@ export class SignalEngine {
       signal.direction === 'LONG' ? signal.entry - candle.low : candle.high - signal.entry;
     signal.mfeR = Math.max(signal.mfeR, favourable / risk);
     signal.maeR = Math.max(signal.maeR, adverse / risk);
+  }
+
+  private isBreakevenStop(signal: TrackedSignal): boolean {
+    if (!signal.breakevenActive) return false;
+    return signal.direction === 'LONG'
+      ? signal.stopLoss >= signal.entry
+      : signal.stopLoss <= signal.entry;
+  }
+
+  private stopHitStatus(signal: TrackedSignal): SignalStatus {
+    return this.isBreakevenStop(signal) ? 'BREAKEVEN_HIT' : 'SL_HIT';
+  }
+
+  private trailingStopPrice(signal: TrackedSignal, tpDistance: number): number {
+    const lock = tpDistance * (BREAKEVEN_LOCK_PCT / 100);
+    const gap = tpDistance * (TRAILING_GAP_PCT / 100);
+    if (signal.direction === 'LONG') {
+      return Math.max(signal.entry + lock, signal.bestPrice - gap);
+    }
+    return Math.min(signal.entry - lock, signal.bestPrice + gap);
+  }
+
+  private updateTrailingStop(signal: TrackedSignal, candle: Kline): void {
+    if (signal.status !== 'OPEN') return;
+    const tpDistance = Math.abs(signal.takeProfit - signal.entry);
+    if (!(tpDistance > 0)) return;
+
+    const favourablePrice = signal.direction === 'LONG' ? candle.high : candle.low;
+    const previousBest = signal.bestPrice;
+    signal.bestPrice =
+      signal.direction === 'LONG'
+        ? Math.max(signal.bestPrice, favourablePrice)
+        : Math.min(signal.bestPrice, favourablePrice);
+    let changed = signal.bestPrice !== previousBest;
+
+    const progress = Math.abs(signal.bestPrice - signal.entry);
+    if (progress < tpDistance * (BREAKEVEN_TRIGGER_PCT / 100)) {
+      if (changed) this.scheduleSave();
+      return;
+    }
+
+    const candidate = this.trailingStopPrice(signal, tpDistance);
+    const nextStop =
+      signal.direction === 'LONG'
+        ? Math.max(signal.stopLoss, candidate)
+        : Math.min(signal.stopLoss, candidate);
+
+    if (!signal.breakevenActive) {
+      signal.breakevenActive = true;
+      changed = true;
+    }
+    if (nextStop !== signal.stopLoss) {
+      signal.stopLoss = nextStop;
+      const trade = this.trades.get(signal.id);
+      if (trade && trade.status === 'OPEN') {
+        trade.stopLoss = nextStop;
+      }
+      changed = true;
+    }
+    if (changed) this.scheduleSave();
   }
 
   private hitLevels(
@@ -1402,7 +1517,7 @@ export class SignalEngine {
         return true;
       }
       if (hit.slHit) {
-        this.resolveSignal(signal, 'SL_HIT', signal.stopLoss, second.closeTime);
+        this.resolveSignal(signal, this.stopHitStatus(signal), signal.stopLoss, second.closeTime);
         return true;
       }
       if (hit.tpHit) {
@@ -1432,6 +1547,7 @@ export class SignalEngine {
     this.closeDummyTrade(signal, status, price, atMs);
     if (status === 'TP_HIT') this.stats.tp += 1;
     else if (status === 'SL_HIT') this.stats.sl += 1;
+    else if (status === 'BREAKEVEN_HIT') this.stats.breakeven += 1;
     else if (status === 'AMBIGUOUS') this.stats.ambiguous += 1;
     else if (status === 'EXPIRED') this.stats.expired += 1;
     this.trimResolvedHistory();
@@ -1439,7 +1555,7 @@ export class SignalEngine {
   }
 
   private toPublicSignal(signal: TrackedSignal, now: number): LiveSignal {
-    const risk = Math.abs(signal.entry - signal.stopLoss);
+    const risk = signal.initialRiskDistance;
     const live = signal.livePrice ?? signal.entry;
     const directionalMove =
       signal.direction === 'LONG' ? live - signal.entry : signal.entry - live;
@@ -1474,6 +1590,7 @@ export class SignalEngine {
       entry: signal.entry,
       stopLoss: signal.stopLoss,
       takeProfit: signal.takeProfit,
+      initialRiskDistance: Number(signal.initialRiskDistance.toPrecision(12)),
       riskPct: signal.riskPct,
       rewardPct: signal.rewardPct,
       roePct: signal.roePct,
@@ -1510,7 +1627,7 @@ export class SignalEngine {
       const dir = path.dirname(this.opts.stateFile);
       fs.mkdirSync(dir, { recursive: true });
       const payload = {
-        version: 6,
+        version: 7,
         dataSource: 'oanda',
         savedAt: Date.now(),
         stats: this.stats,
@@ -1545,7 +1662,14 @@ export class SignalEngine {
       if (raw.dataSource !== 'oanda') {
         this.signals.clear();
         this.lastTriggerBySymbol.clear();
-        this.stats = { total: 0, tp: 0, sl: 0, ambiguous: 0, expired: 0 };
+        this.stats = {
+          total: 0,
+          tp: 0,
+          sl: 0,
+          breakeven: 0,
+          ambiguous: 0,
+          expired: 0,
+        };
         this.trades.clear();
         this.withdrawals = [];
         this.balance = this.startingBalance;
@@ -1572,10 +1696,17 @@ export class SignalEngine {
         }
         this.withdrawals.sort((a, b) => b.requestedAt - a.requestedAt);
       }
+      let migratedBreakeven = 0;
       if (Array.isArray(raw.signals)) {
         for (const item of raw.signals) {
           const tracked = this.normalizeStoredSignal(item);
-          if (tracked && toInstrument(tracked.symbol)) this.signals.set(tracked.id, tracked);
+          if (!tracked || !toInstrument(tracked.symbol)) continue;
+          if (tracked.status === 'SL_HIT' && this.isBreakevenStop(tracked)) {
+            tracked.status = 'BREAKEVEN_HIT';
+            tracked.verdict = verdictFor('BREAKEVEN_HIT');
+            migratedBreakeven += 1;
+          }
+          this.signals.set(tracked.id, tracked);
         }
       }
       if (raw.lastTriggerBySymbol && typeof raw.lastTriggerBySymbol === 'object') {
@@ -1605,19 +1736,30 @@ export class SignalEngine {
         signal.liveUpdatedAt = now;
         signal.holdMinutes = Number(((now - signal.signalTime) / 60_000).toFixed(2));
       }
-      const derived: EngineStats = { total: 0, tp: 0, sl: 0, ambiguous: 0, expired: 0 };
+      const derived: EngineStats = {
+        total: 0,
+        tp: 0,
+        sl: 0,
+        breakeven: 0,
+        ambiguous: 0,
+        expired: 0,
+      };
       for (const signal of this.signals.values()) {
         derived.total += 1;
         if (signal.status === 'TP_HIT') derived.tp += 1;
         else if (signal.status === 'SL_HIT') derived.sl += 1;
+        else if (signal.status === 'BREAKEVEN_HIT') derived.breakeven += 1;
         else if (signal.status === 'AMBIGUOUS') derived.ambiguous += 1;
         else if (signal.status === 'EXPIRED') derived.expired += 1;
       }
       const stored = raw.stats;
+      const storedSl = Math.max(0, (Number(stored?.sl) || 0) - migratedBreakeven);
+      const storedBreakeven = (Number(stored?.breakeven) || 0) + migratedBreakeven;
       this.stats = {
         total: Math.max(Number(stored?.total) || 0, derived.total),
         tp: Math.max(Number(stored?.tp) || 0, derived.tp),
-        sl: Math.max(Number(stored?.sl) || 0, derived.sl),
+        sl: Math.max(storedSl, derived.sl),
+        breakeven: Math.max(storedBreakeven, derived.breakeven),
         ambiguous: Math.max(Number(stored?.ambiguous) || 0, derived.ambiguous),
         expired: Math.max(Number(stored?.expired) || 0, derived.expired),
       };
@@ -1666,6 +1808,8 @@ export class SignalEngine {
           signal.resolutionPrice ?? signal.entry,
           signal.resolvedAt ?? signal.signalTime
         );
+      } else if (trade.status === 'CLOSED' && signal.status !== 'OPEN') {
+        trade.outcome = signal.status;
       }
     }
     this.trimTradeHistory();
@@ -1789,6 +1933,17 @@ export class SignalEngine {
       signalMinuteEnd,
       nextCandleOpen: Number(raw.nextCandleOpen ?? signalMinuteEnd),
       intraDone: raw.intraDone === undefined ? Date.now() >= signalMinuteEnd : Boolean(raw.intraDone),
+      initialRiskDistance:
+        Number.isFinite(Number(raw.initialRiskDistance)) && Number(raw.initialRiskDistance) > 0
+          ? Number(raw.initialRiskDistance)
+          : Math.abs(Number(raw.entry) - Number(raw.stopLoss)),
+      bestPrice:
+        Number.isFinite(Number(raw.bestPrice)) && Number(raw.bestPrice) > 0
+          ? direction === 'LONG'
+            ? Math.max(Number(raw.entry), Number(raw.bestPrice))
+            : Math.min(Number(raw.entry), Number(raw.bestPrice))
+          : Number(raw.entry),
+      breakevenActive: Boolean(raw.breakevenActive),
     };
     return tracked;
   }

@@ -47,7 +47,7 @@ The app combines a real-time signal engine with a polished React interface, a si
 Most signal dashboards stop at a marker on a chart. This project focuses on the full workflow:
 
 - **Risk-defined signals** — every trade targets **5% of the current account balance**.
-- **Fixed 40/80 pip levels** — stop loss is **40 pips**, take profit is **80 pips**.
+- **Per-instrument 2R targets** — each pair has a fixed stop distance, with take profit at **2× the stop**.
 - **Live market context** — current price, entry, stop, target, R multiple, and progress.
 - **A visual trade state** — each open signal includes a compact SL-vs-TP tug-of-war scene with the live market marker and entry point.
 - **A simulated account** — realized PnL, floating PnL, equity, deposits, and trade history.
@@ -71,18 +71,19 @@ Most signal dashboards stop at a marker on a chart. This project focuses on the 
 ### Risk model
 
 - **Risk per trade:** 5% of the current simulated account balance.
-- **Stop loss:** fixed **40 pips** per instrument.
-- **Take profit:** fixed **80 pips** per instrument.
+- **Stop loss:** fixed **per-instrument distance**.
+- **Take profit:** **2× the stop distance**.
 - **Risk-to-reward ratio:** exactly **1:2**.
+- **Breakeven trail:** at **50% of TP**, the stop moves to a **20% TP profit lock**, then trails **30% of TP** behind the best favorable price.
 - Position size is calculated from account risk, instrument pip size, contract units, and USD quote conversion.
 - Lots round to the **0.01 lot step**, with a **0.01 minimum**, so actual risk can vary slightly.
-- Open positions are re-targeted to the active risk model when the engine starts.
+- Open positions are re-targeted to the active risk model when the engine starts, while preserving any trailing-stop progress.
 
 ### Dashboard
 
 - Live Signals and Trades pages.
 - Mobile-first responsive layout.
-- Open, TP, SL, ambiguous, and expired signal filters.
+- Open, TP, SL, breakeven, ambiguous, and expired signal filters.
 - Per-signal mini tug-of-war visualization with an SL/TP scale, live market marker, and entry tick.
 - Market watch strip with current prices and 24-hour context.
 - Account summary with balance, equity, realized PnL, floating PnL, and open trade count.
@@ -135,7 +136,7 @@ M1 reversal candle + volume confirmation
 Duplicate and cooldown checks
       │
       ▼
-5% balance risk + 40/80 pip sizing
+5% balance risk + per-pair SL + 2R TP
       │
       ▼
 Simulated trade opened
@@ -316,13 +317,18 @@ All state-changing routes are same-origin guarded and rate-limited to 30 request
 The engine is intentionally explicit about risk:
 
 - **Account risk:** 5% of the current simulated balance at signal creation.
-- **Stop distance:** fixed 40 pips for every instrument.
-- **Take-profit distance:** fixed 80 pips for every instrument.
+- **Stop distance:** fixed per instrument.
+- **Take-profit distance:** 2× the stop distance.
 - **Risk-to-reward:** exactly 1:2.
+- **Breakeven trail:** once price reaches 50% of TP, SL moves to 20% of TP profit and then trails 30% of TP behind the best favorable price.
 - **Position size:** calculated automatically and rounded to the nearest 0.01 lot, with a 0.01 minimum.
 - **Balance model:** the simulated balance excludes floating PnL; equity includes it.
 
-Because lots round to 0.01, the actual risk can be slightly above or below 5%. For example, a 40-pip stop on XAUUSD at a $96.03 balance needs 0.012 lots for an exact 5% risk; the 0.01 lot step uses either 0.01 lot (4.17%) or 0.02 lot (8.33%). The engine uses the nearest available lot.
+Because lots round to 0.01, the actual risk can be slightly above or below 5%. The engine uses the nearest available lot.
+
+Trailing stops are evaluated on closed candles after SL/TP checks, so the engine does not assume an intrabar high or low occurred before a stop was touched. The original risk distance remains the denominator for MFE/MAE and unrealized R calculations after the stop moves.
+
+When a trailed stop closes a trade at or above entry for a long, or at or below entry for a short, the outcome is recorded as **breakeven hit** instead of **SL hit**. Breakeven exits have their own dashboard count and history filter, are excluded from the SL total, and count as wins in the win-rate calculation.
 
 ---
 

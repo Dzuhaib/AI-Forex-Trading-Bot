@@ -166,9 +166,11 @@ function OutcomeBadge({ trade }: { trade: DummyTrade }) {
       ? { label: 'TP hit', text: 'text-[#1d8f3a]', dot: 'bg-[#34c759]' }
       : outcome === 'SL_HIT'
         ? { label: 'SL hit', text: 'text-[#d70015]', dot: 'bg-[#ff3b30]' }
-        : outcome === 'AMBIGUOUS'
-          ? { label: 'Ambiguous', text: 'text-[#a05a00]', dot: 'bg-[#ff9f0a]' }
-          : { label: 'Expired', text: 'text-[#86868b]', dot: 'bg-[#aeaeb2]' };
+        : outcome === 'BREAKEVEN_HIT'
+          ? { label: 'Breakeven hit', text: 'text-[#6e56cf]', dot: 'bg-[#af52de]' }
+          : outcome === 'AMBIGUOUS'
+            ? { label: 'Ambiguous', text: 'text-[#a05a00]', dot: 'bg-[#ff9f0a]' }
+            : { label: 'Expired', text: 'text-[#86868b]', dot: 'bg-[#aeaeb2]' };
   return (
     <span className={`inline-flex items-center gap-1.5 text-[11px] font-medium ${meta.text}`}>
       <span className={`h-1.5 w-1.5 rounded-full ${meta.dot}`} />
@@ -811,7 +813,7 @@ export const DummyTradesViewer: React.FC = () => {
             Trades
           </h1>
           <p className="mt-1.5 text-[13px] text-[#6e6e73]">
-            Auto lot · {account?.riskPercent ?? 5}% balance risk · 40p SL · 80p TP
+            Auto lot · {account?.riskPercent ?? 5}% balance risk · per-pair SL · 2R TP
           </p>
         </div>
         <div className="grid grid-cols-2 gap-2 sm:flex">
@@ -913,13 +915,13 @@ export const DummyTradesViewer: React.FC = () => {
             <div className="rounded-xl bg-[#f5f5f7] px-3 py-2">
               <div className="text-[9px] uppercase tracking-[0.06em] text-[#86868b]">SL</div>
               <div className="mt-0.5 text-[13px] font-semibold tabular-nums text-[#1d1d1f]">
-                {account?.stopPips ?? 40}p
+                Per pair
               </div>
             </div>
             <div className="rounded-xl bg-[#f5f5f7] px-3 py-2">
               <div className="text-[9px] uppercase tracking-[0.06em] text-[#86868b]">TP</div>
               <div className="mt-0.5 text-[13px] font-semibold tabular-nums text-[#1d1d1f]">
-                {account?.takeProfitPips ?? 80}p
+                2R
               </div>
             </div>
             <div className="rounded-xl bg-[#f5f5f7] px-3 py-2">
