@@ -53,8 +53,61 @@ textarea {
   will-change: transform;
 }
 
+.beast-roar {
+  transform-box: fill-box;
+  transform-origin: 50% 80%;
+  animation: beast-roar 1.8s ease-in-out infinite;
+  will-change: transform;
+}
+
+.beast-jaw {
+  transform-box: fill-box;
+  transform-origin: 6% 3%;
+  animation: beast-jaw 1.35s ease-in-out infinite;
+  will-change: transform;
+}
+
+@keyframes beast-roar {
+  0%,
+  100% {
+    transform: translateY(0) rotate(0deg);
+  }
+  18% {
+    transform: translateY(-0.4px) rotate(-1.4deg);
+  }
+  36% {
+    transform: translateY(0.3px) rotate(0.8deg);
+  }
+  54% {
+    transform: translateY(-0.3px) rotate(-1deg);
+  }
+  72% {
+    transform: translateY(0.2px) rotate(0.6deg);
+  }
+}
+
+@keyframes beast-jaw {
+  0%,
+  18%,
+  100% {
+    transform: rotate(0deg);
+  }
+  30%,
+  62% {
+    transform: rotate(5deg);
+  }
+  80% {
+    transform: rotate(1.2deg);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .tug-mini-marker {
     transition: none;
+  }
+
+  .beast-roar,
+  .beast-jaw {
+    animation: none;
   }
 }

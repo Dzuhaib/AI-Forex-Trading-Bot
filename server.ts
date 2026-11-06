@@ -3,6 +3,13 @@ import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import dotenv from 'dotenv';
 import { createSignalEngineFromEnv } from './signalEngine';
+import { Mt5Broker } from './mt5Broker';
+import { loadDashboardState, saveDashboardState } from './dashboardState';
+import {
+  getGeminiApiKey,
+  normalizeAnnouncementText,
+  synthesizeAnnouncement,
+} from './geminiVoice';
 
 dotenv.config();
 
@@ -51,8 +58,24 @@ function blockUnsafeMutation(req: Request, res: Response, next: NextFunction): v
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
-  const signalEngine = createSignalEngineFromEnv();
+  const PORT = Number(process.env.PORT) || 5000;
+  const mt5Broker = new Mt5Broker();
+  const persisted = loadDashboardState();
+  const signalEngine = createSignalEngineFromEnv(mt5Broker, persisted);
+
+  const applyDetectedSuffix = async (): Promise<string | null> => {
+    const detected = await signalEngine.detectAndApplySymbolSuffix();
+    if (detected !== null) {
+      saveDashboardState({ mt5SymbolSuffix: detected });
+      return detected;
+    }
+    const fallback = loadDashboardState().mt5SymbolSuffix ?? process.env.MT5_SYMBOL_SUFFIX ?? '';
+    if (fallback) {
+      mt5Broker.setSymbolSuffix(fallback);
+      signalEngine.setSymbolSuffix(fallback);
+    }
+    return null;
+  };
 
   app.disable('x-powered-by');
   app.set('json escape', true);
@@ -86,22 +109,107 @@ async function startServer() {
     });
   });
 
-  app.post('/api/account/withdraw', (req, res) => {
-    const result = signalEngine.withdraw((req.body ?? {}) as Record<string, unknown>);
-    if (!result.ok) {
-      res.status(400).json({ error: result.error });
-      return;
-    }
-    res.json(result);
+  app.get('/api/pairs', async (_req, res) => {
+    await signalEngine.ensurePairsLoaded();
+    res.set('Cache-Control', 'no-store');
+    res.json(signalEngine.getPairs());
   });
 
-  app.post('/api/account/add-balance', (req, res) => {
-    const result = signalEngine.addBalance((req.body ?? {}) as Record<string, unknown>);
+  app.post('/api/pairs/add', async (req, res) => {
+    await signalEngine.ensurePairsLoaded();
+    const body = req.body ?? {};
+    let result = signalEngine.addPair(body.symbol);
     if (!result.ok) {
-      res.status(400).json({ error: result.error });
+      await signalEngine.ensurePairsLoaded(true);
+      result = signalEngine.addPair(body.symbol);
+    }
+    if (result.ok) {
+      saveDashboardState({ activePairs: result.pairs.active });
+      signalEngine.triggerScan();
+    }
+    res.status(result.ok ? 200 : 400).json(result);
+  });
+
+  app.post('/api/pairs/remove', async (req, res) => {
+    await signalEngine.ensurePairsLoaded();
+    const body = req.body ?? {};
+    let result = signalEngine.removePair(body.symbol);
+    if (!result.ok) {
+      await signalEngine.ensurePairsLoaded(true);
+      result = signalEngine.removePair(body.symbol);
+    }
+    if (result.ok) {
+      saveDashboardState({ activePairs: result.pairs.active });
+      signalEngine.triggerScan();
+    }
+    res.status(result.ok ? 200 : 400).json(result);
+  });
+
+  app.get('/api/mt5/status', (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json(mt5Broker.getStatus());
+  });
+
+  app.post('/api/mt5/connect', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const result = await mt5Broker.connect({ ...body, symbolSuffix: '' });
+      if (result.ok) {
+        signalEngine.resetJournal();
+        await applyDetectedSuffix();
+        await signalEngine.ensurePairsLoaded(true);
+      }
+      res.status(result.ok ? 200 : 400).json(result);
+    } catch {
+      res.status(500).json({ error: 'MT5 connection failed unexpectedly.' });
+    }
+  });
+
+  app.post('/api/mt5/disconnect', async (_req, res) => {
+    try {
+      const result = await mt5Broker.disconnect();
+      res.json(result);
+    } catch {
+      res.status(500).json({ error: 'MT5 disconnect failed unexpectedly.' });
+    }
+  });
+
+  app.post('/api/mt5/symbol-suffix', (req, res) => {
+    try {
+      const result = mt5Broker.setSymbolSuffix((req.body ?? {}).symbolSuffix);
+      if (result.ok) {
+        const suffix = String(result.status.config?.symbolSuffix ?? '').trim();
+        saveDashboardState({ mt5SymbolSuffix: suffix });
+        signalEngine.setSymbolSuffix(suffix);
+      }
+      res.status(result.ok ? 200 : 400).json(result);
+    } catch {
+      res.status(500).json({ error: 'Updating the symbol suffix failed unexpectedly.' });
+    }
+  });
+
+  app.post('/api/voice/announce', async (req, res) => {
+    const body = (req.body ?? {}) as { text?: unknown };
+    const text = normalizeAnnouncementText(body.text);
+    if (text.length < 3 || text.length > 300) {
+      res.status(400).json({ error: 'Announcement text must be 3-300 characters.' });
       return;
     }
-    res.json(result);
+    if (!getGeminiApiKey()) {
+      res.status(503).json({ error: 'Voice announcement is not configured.' });
+      return;
+    }
+    try {
+      const { buffer, cacheHit } = await synthesizeAnnouncement(text);
+      res.set('Content-Type', 'audio/wav');
+      res.set('Cache-Control', 'no-store');
+      if (cacheHit) res.set('X-Voice-Cache', 'hit');
+      res.send(buffer);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'unknown error';
+      console.error(`Voice announcement failed: ${message}`);
+      res.status(502).json({ error: 'Voice generation failed.' });
+    }
   });
 
   if (process.env.NODE_ENV !== 'production') {
@@ -120,6 +228,18 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on http://localhost:${PORT}`);
+    console.log('Attaching to the logged-in MT5 account...');
+    void mt5Broker
+      .autoConnect(process.env.MT5_TERMINAL_PATH ?? '', '')
+      .then(async (result) => {
+        if (result.ok) {
+          console.log(`MT5 account #${result.status.account?.login ?? ''} connected.`);
+          await applyDetectedSuffix();
+          await signalEngine.ensurePairsLoaded(true);
+        } else {
+          console.error(`MT5 auto-connect failed: ${result.error ?? 'unknown error'}`);
+        }
+      });
     signalEngine.start();
   });
 }

@@ -6,9 +6,9 @@
 
 # Forex Trading Bot
 
-**A full-stack Forex signal engine and simulated trading dashboard powered by live OANDA market data.**
+**A full-stack Forex signal engine with optional MetaTrader 5 demo execution, powered by live OANDA market data.**
 
-Signals · Risk management · Live analytics · Trade journal · Account simulation
+Signals · Risk management · Live analytics · Trade journal · MT5 execution
 
 <br />
 
@@ -22,7 +22,7 @@ Signals · Risk management · Live analytics · Trade journal · Account simulat
 [![OANDA](https://img.shields.io/badge/OANDA-v20-00A3E0?style=for-the-badge)](https://developer.oanda.com/)
 [![Risk](https://img.shields.io/badge/risk-5%25%20of%20balance-FF3B30?style=for-the-badge)](#risk-model)
 [![Reward](https://img.shields.io/badge/reward-1%3A2%20RR-34C759?style=for-the-badge)](#risk-model)
-[![Mode](https://img.shields.io/badge/mode-simulated%20trading-0071E3?style=for-the-badge)](#important-limitations)
+[![Mode](https://img.shields.io/badge/mode-MT5%20demo-0071E3?style=for-the-badge)](#important-limitations)
 
 <br />
 
@@ -36,9 +36,9 @@ Signals · Risk management · Live analytics · Trade journal · Account simulat
 
 **Forex Trading Bot** is a self-hosted Forex dashboard that turns live OANDA price data into actionable, risk-defined trade ideas. It scans 14 FX, metal, energy, and crypto instruments, detects high-volume untested supply and demand zones, confirms entries with M1 reversal volume, and tracks each idea through take profit, stop loss, ambiguity, or expiry.
 
-The app combines a real-time signal engine with a polished React interface, a simulated account, a trade journal, and balance controls. It is designed as an educational and research platform for building disciplined, risk-first trading workflows.
+The app combines a real-time signal engine with a polished React interface and a broker-backed trade journal. Execution and account data are MT5-only: the dashboard does not create simulated or paper trades. When a MetaTrader 5 demo account is connected, balance, equity, positions, and closed deals come from that broker account. It is designed as an educational and research platform for building disciplined, risk-first trading workflows.
 
-> **This is a demo trading system.** Signals and trades are simulated. The project does not place live orders.
+> **This is a demo trading system.** Signals are generated from live OANDA market data. When connected, new signals are also executed on a MetaTrader 5 demo account. Real MT5 accounts are rejected by the broker layer.
 
 ---
 
@@ -50,7 +50,7 @@ Most signal dashboards stop at a marker on a chart. This project focuses on the 
 - **Per-instrument 2R targets** — each pair has a fixed stop distance, with take profit at **2× the stop**.
 - **Live market context** — current price, entry, stop, target, R multiple, and progress.
 - **A visual trade state** — each open signal includes a compact SL-vs-TP tug-of-war scene with the live market marker and entry point.
-- **A simulated account** — realized PnL, floating PnL, equity, deposits, and trade history.
+- **A broker-backed account** — balance, equity, floating PnL, open positions, and closed deals come from the connected MT5 demo account. Nothing is simulated locally.
 - **Operational safety** — same-origin mutation checks, rate limiting, JSON body limits, and hardened response headers.
 
 ---
@@ -59,7 +59,7 @@ Most signal dashboards stop at a marker on a chart. This project focuses on the 
 
 ### Signal engine
 
-- 14 instruments: `XAUUSD`, `EURUSD`, `GBPUSD`, `AUDUSD`, `NZDUSD`, `USDJPY`, `EURJPY`, `GBPJPY`, `USDCHF`, `GBPCHF`, `AUDCHF`, `AUDCAD`, `BTCUSD`, and `XTIUSD`.
+- 8 instruments: `XAUUSD`, `WTI`, `EURUSD`, `GBPUSD`, `BTCUSD`, `NZDUSD`, `NZDJPY`, and `GBPJPY`.
 - H1 and M30 body-zone detection using high-volume candles.
 - M1 reversal confirmation with relative volume expansion.
 - Live S5 price refresh for open positions.
@@ -68,9 +68,19 @@ Most signal dashboards stop at a marker on a chart. This project focuses on the 
 - Automatic TP, SL, ambiguous-candle, and 24-hour expiry resolution.
 - Duplicate signal protection and historical outcome tracking.
 
+### MT5 demo execution
+
+- Optional MetaTrader 5 login from the Trades page.
+- Demo accounts only; real accounts are rejected before any order is sent.
+- New signals place market orders with the engine's SL and TP on the MT5 side.
+- Trailing-stop changes are mirrored to the open MT5 position.
+- Balance, equity, margin, floating PnL, open positions, and closed MT5 deals drive the dashboard account and trade journal.
+- Passwords stay in server memory only and are never written to disk or logs.
+- Existing tracked signals are not back-filled to MT5 when you connect.
+
 ### Risk model
 
-- **Risk per trade:** 5% of the current simulated account balance.
+- **Risk per trade:** 5% of the current account balance; the connected MT5 demo balance is used for new entries when available.
 - **Stop loss:** fixed **per-instrument distance**.
 - **Take profit:** **2× the stop distance**.
 - **Risk-to-reward ratio:** exactly **1:2**.
@@ -86,7 +96,7 @@ Most signal dashboards stop at a marker on a chart. This project focuses on the 
 - Open, TP, SL, breakeven, ambiguous, and expired signal filters.
 - Per-signal mini tug-of-war visualization with an SL/TP scale, live market marker, and entry tick.
 - Market watch strip with current prices and 24-hour context.
-- Account summary with balance, equity, realized PnL, floating PnL, and open trade count.
+- Account summary with balance, equity, realized PnL, floating PnL, and open trade count from MT5 when connected.
 - Trade history with entry, stop, target, exit, lot size, and outcome.
 - Automatic per-trade position sizing and balance deposits.
 
@@ -139,7 +149,7 @@ Duplicate and cooldown checks
 5% balance risk + per-pair SL + 2R TP
       │
       ▼
-Simulated trade opened
+MT5 market order placed (only while connected)
       │
       ▼
 TP / SL / ambiguous / expiry watcher
@@ -166,9 +176,9 @@ When a signal is accepted:
 
 ```text
 riskUsd = account balance × 5%
-slDistance = 40 × pip size
-tpDistance = 80 × pip size
-lotSize = riskUsd / (40 × pip value per lot)
+slDistance = per-instrument stop distance
+tpDistance = 2 × slDistance
+lotSize = riskUsd / (slDistance × value per lot)
 ```
 
 The engine converts the fixed pip distances into instrument prices using each symbol's pip size. Position size is derived from the 5% risk target, contract units, and USD quote conversion, then rounded to the 0.01 lot step. Stop loss and take profit are placed symmetrically around the entry, with TP at twice the stop distance.
@@ -182,9 +192,15 @@ The engine tracks each open signal against live candles. A trade closes when:
 - an ambiguous candle touches both levels,
 - the maximum tracking window expires.
 
-Closed trades update the simulated balance and are written to the local state file.
+Closed trades are read from MT5 history. The dashboard does not maintain a local simulated trade journal.
 
-### 6. Dashboard updates
+### 6. MT5 demo execution
+
+On the Trades page, enter the MT5 demo account number, password, server, and optional terminal path. The broker symbol suffix is detected automatically from the logged-in terminal. The server starts a Python bridge and keeps the password in memory only.
+
+When a new signal is accepted while connected, the bridge resolves the broker symbol, floor-rounds the position size to the broker volume step, and sends a market order with the engine's existing SL and TP. Trailing-stop changes are mirrored to the MT5 position. While disconnected, signals are still generated but nothing is executed or added to the trade journal. The dashboard account summary and trade journal are sourced from the MT5 demo account (open positions plus the last 90 days of closed deals), shown 10 trades per page.
+
+### 7. Dashboard updates
 
 The React client polls the signal API, renders live cards, and keeps the market strip, account summary, and trade journal in sync.
 
@@ -197,6 +213,8 @@ The React client polls the signal API, renders live cards, and keeps the market 
 - Node.js 20 or newer
 - npm
 - An OANDA v20 API token
+- Optional: MetaTrader 5 terminal and Python 3.10+ for demo order execution
+- Optional: Python `MetaTrader5` package (`pip install MetaTrader5`)
 
 ### 1. Clone the repository
 
@@ -233,9 +251,22 @@ Use `practice` while developing. Switch to `live` only when you understand the r
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+Open [http://localhost:5000](http://localhost:5000).
 
 The first scan can take a moment while the engine loads candles. The dashboard will populate as market data arrives.
+
+Dashboard pair selections and the detected MT5 symbol suffix are saved to `data/dashboard-state.json`. Once saved, that exact active pair list is restored on restart instead of the defaults, including removals and MT5-only pairs. The suffix is re-detected automatically on every connect and stored exactly as the broker uses it (`m`, `.m`, `c`, etc.).
+
+### 5. Optional MT5 demo execution
+
+1. Install and open MetaTrader 5.
+2. Log in to a **demo** account.
+3. Enable **Algo Trading** in the MT5 toolbar.
+4. If Python is not on `PATH`, set `MT5_PYTHON` in `.env`.
+5. Open the Trades page and fill in the MT5 account number, password, server, and optional terminal path.
+6. Connect. Only signals opened after connecting are sent to MT5.
+
+The password is kept in server memory only. It is not written to disk, local storage, or logs.
 
 ---
 
@@ -255,8 +286,11 @@ The first scan can take a moment while the engine loads candles. The dashboard w
 | `SIGNAL_LEVERAGE` | `10` | Leverage value shown in return-on-equity calculations. |
 | `SIGNAL_SCAN_CONCURRENCY` | `10` | Parallel symbol scans. |
 | `SIGNAL_WATCH_CONCURRENCY` | `6` | Parallel trade watchers. |
-| `SIGNAL_PAIRS` | all 14 | Comma-separated symbol allowlist. |
-| `SIGNAL_STATE_FILE` | `data/live_signals_state.json` | Local persistence path. |
+| `SIGNAL_PAIRS` | 8 (XAUUSD, WTI, EURUSD, GBPUSD, BTCUSD, NZDUSD, NZDJPY, GBPJPY) | Initial active pairs when no dashboard state has been saved. All OANDA FX pairs and connected MT5 broker symbols are available from the dashboard pair search. |
+| `MT5_PYTHON` | `python` | Python executable used to start the MetaTrader 5 bridge. |
+| `MT5_TERMINAL_PATH` | auto-detect | Optional `terminal64.exe` path for auto-connect. |
+| `MT5_SYMBOL_SUFFIX` | auto-detected | Fallback only. On connect, the suffix is detected from the MT5 symbol catalog and saved exactly as the broker uses it: `m`, `.m`, `c`, `.c`, etc. |
+| `GEMINI_API_KEY` | unset | Gemini TTS key for voice-trade announcements. Falls back to browser speech when unset. |
 
 ---
 
@@ -277,11 +311,9 @@ The first scan can take a moment while the engine loads candles. The dashboard w
 .
 ├── assets/
 │   └── banner.png
-├── data/
-│   └── live_signals_state.json   # local runtime state (gitignored)
 ├── src/
 │   ├── components/
-│   │   ├── DummyTradesViewer.tsx
+│   │   ├── TradesViewer.tsx
 │   │   ├── LiveSignalsViewer.tsx
 │   │   ├── MiniTugOfWar.tsx
 │   │   └── ...
@@ -291,6 +323,9 @@ The first scan can take a moment while the engine loads candles. The dashboard w
 │   └── types.ts
 ├── .env.example
 ├── .gitignore
+├── dashboardState.ts
+├── data/
+│   └── dashboard-state.json
 ├── index.html
 ├── package.json
 ├── server.ts
@@ -306,7 +341,13 @@ The first scan can take a moment while the engine loads candles. The dashboard w
 | --- | --- | --- |
 | `GET` | `/api/signals` | Full dashboard payload: signals, market, account, and trades. |
 | `POST` | `/api/signals/scan` | Trigger an immediate scan. |
-| `POST` | `/api/account/add-balance` | Add simulated balance. |
+| `GET` | `/api/pairs` | Pair catalog, aliases, categories, and active pairs. |
+| `POST` | `/api/pairs/add` | Add an active pair and persist the list. |
+| `POST` | `/api/pairs/remove` | Remove an active pair and persist the list. |
+| `GET` | `/api/mt5/status` | MT5 connection, account, and broker positions. |
+| `POST` | `/api/mt5/connect` | Connect an MT5 account; credentials stay in memory. |
+| `POST` | `/api/mt5/disconnect` | Disconnect MT5 and stop the broker bridge. |
+| `POST` | `/api/mt5/symbol-suffix` | Advanced override for an exact broker suffix such as `m` or `.m`; normal connects auto-detect it. |
 
 All state-changing routes are same-origin guarded and rate-limited to 30 requests per minute per client.
 
@@ -316,13 +357,13 @@ All state-changing routes are same-origin guarded and rate-limited to 30 request
 
 The engine is intentionally explicit about risk:
 
-- **Account risk:** 5% of the current simulated balance at signal creation.
+- **Account risk:** 5% of the current balance at signal creation; when MT5 is connected, new entries use the MT5 demo balance.
 - **Stop distance:** fixed per instrument.
 - **Take-profit distance:** 2× the stop distance.
 - **Risk-to-reward:** exactly 1:2.
 - **Breakeven trail:** once price reaches 50% of TP, SL moves to 20% of TP profit and then trails 30% of TP behind the best favorable price.
 - **Position size:** calculated automatically and rounded to the nearest 0.01 lot, with a 0.01 minimum.
-- **Balance model:** the simulated balance excludes floating PnL; equity includes it.
+- **Balance model:** balance and equity are read directly from MT5; equity includes floating PnL.
 
 Because lots round to 0.01, the actual risk can be slightly above or below 5%. The engine uses the nearest available lot.
 
@@ -342,15 +383,21 @@ When a trailed stop closes a trade at or above entry for a long, or at or below 
 - Security headers include `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, and `Cross-Origin-Resource-Policy`.
 - The Express fingerprint header is disabled.
 - JSON responses are escaped.
+- MT5 passwords are held in server memory only and are never persisted or returned by the API.
+- MT5 order placement rejects non-demo accounts.
 
-Never expose your OANDA API token in the browser, screenshots, issues, or commits.
+Never expose your OANDA API token or MT5 password in the browser, screenshots, issues, or commits.
 
 ---
 
 ## Important Limitations
 
 - This project is **not** a live trading system. It does not submit OANDA orders.
-- The account and deposits are simulated.
+- MT5 execution is limited to **demo accounts**; real accounts are rejected.
+- When MT5 is disconnected, signals still generate but there is no account balance, execution, or local trade journal. When connected, balance and trades come from the MT5 demo account.
+- Existing open signals are not back-filled to MT5 on connect; only new signals are executed.
+- The MT5 bridge requires the MetaTrader 5 terminal to stay open and Algo Trading to be enabled.
+- Broker suffixes such as `m` or `.m` are detected automatically; a different terminal path can still be set manually.
 - The local JSON state file is suitable for a single-instance demo, not a horizontally scaled production deployment.
 - The included Express + Vite setup expects a persistent Node.js process.
 - Market data availability and rate limits depend on your OANDA account.
@@ -371,7 +418,7 @@ Builder of risk-first trading dashboards and full-stack market tooling. This pro
 
 ## Disclaimer
 
-Trading Forex, metals, energy, and crypto involves substantial risk. This software is provided for educational and research purposes only. Past simulated performance does not guarantee future results. Always test with a practice account and never risk capital you cannot afford to lose.
+Trading Forex, metals, energy, and crypto involves substantial risk. This software is provided for educational and research purposes only. Past demo performance does not guarantee future results. Always test with a practice account and never risk capital you cannot afford to lose.
 
 <p align="center">
   <sub>Built with Node.js, TypeScript, React, and OANDA market data.</sub>

@@ -62,9 +62,28 @@ export interface MarketTicker {
   updatedAt: number;
 }
 
-export type DummyTradeStatus = 'OPEN' | 'CLOSED';
+export interface PairOption {
+  symbol: string;
+  name: string;
+  active: boolean;
+  aliases?: string[];
+  category?: string;
+}
 
-export interface DummyTrade {
+export interface PairsResponse {
+  catalog: PairOption[];
+  active: string[];
+}
+
+export interface PairMutationResult {
+  ok: boolean;
+  error?: string;
+  pairs: PairsResponse;
+}
+
+export type Mt5TradeStatus = 'OPEN' | 'CLOSED';
+
+export interface Mt5Trade {
   id: string;
   signalId: string;
   symbol: string;
@@ -78,39 +97,93 @@ export interface DummyTrade {
   closedAt: number | null;
   closedAtUtc: string | null;
   exitPrice: number | null;
-  status: DummyTradeStatus;
+  status: Mt5TradeStatus;
   outcome: SignalStatus | null;
   pnl: number;
   unrealizedPnl: number;
   balanceAfter: number | null;
+  mt5Ticket: number | null;
+  mt5Symbol: string | null;
+  mt5Volume: number | null;
+  executedAt: number | null;
+  executionError: string | null;
+}
+
+export type Mt5ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
+
+export interface Mt5Account {
+  login: number;
+  name: string;
+  server: string;
+  company: string;
+  currency: string;
+  balance: number;
+  equity: number;
+  profit: number;
+  margin: number;
+  marginFree: number;
+  marginLevel: number | null;
+  leverage: number;
+  tradeMode: number;
+  isDemo: boolean;
+  tradeAllowed: boolean;
+  tradeExpert: boolean;
+  credit: number;
+}
+
+export interface Mt5Terminal {
+  connected: boolean;
+  tradeAllowed: boolean;
+  path: string;
+  name: string;
+  company: string;
+  build: number;
+}
+
+export interface Mt5Position {
+  ticket: number;
+  symbol: string;
+  type: 'BUY' | 'SELL';
+  volume: number;
+  priceOpen: number;
+  priceCurrent: number;
+  sl: number;
+  tp: number;
+  profit: number;
+  swap: number;
+  magic: number;
+  comment: string;
+  time: number;
+}
+
+export interface Mt5ConfigSummary {
+  login: number;
+  server: string;
+  terminalPath: string;
+  symbolSuffix: string;
+}
+
+export interface Mt5Status {
+  state: Mt5ConnectionState;
+  connected: boolean;
+  account: Mt5Account | null;
+  terminal: Mt5Terminal | null;
+  positions: Mt5Position[];
+  config: Mt5ConfigSummary | null;
+  connectedAt: number | null;
+  lastSyncAt: number | null;
+  lastError: string | null;
 }
 
 export interface AccountSummary {
-  startingBalance: number;
   balance: number;
   equity: number;
   unrealizedPnl: number;
   realizedPnl: number;
-  withdrawnTotal: number;
   openTrades: number;
   closedTrades: number;
   riskPercent: number;
   currency: string;
-}
-
-export type WithdrawalMethod = 'JAZZCASH' | 'EASYPAISA';
-
-export interface Withdrawal {
-  id: string;
-  method: WithdrawalMethod;
-  accountNumber: string;
-  accountTitle: string;
-  amount: number;
-  status: 'PAID';
-  reference: string;
-  requestedAt: number;
-  requestedAtUtc: string;
-  balanceAfter: number;
 }
 
 export interface SignalEngineStatus {
@@ -135,7 +208,6 @@ export interface SignalEngineStatus {
   breakeven: number;
   ambiguous: number;
   expired: number;
-  winRatePct: number;
   symbolSource: string;
   lastError: string | null;
 }
@@ -146,7 +218,7 @@ export interface SignalsResponse {
   signals: LiveSignal[];
   nearZones: NearZone[];
   market: MarketTicker[];
-  account: AccountSummary;
-  trades: DummyTrade[];
-  withdrawals: Withdrawal[];
+  account: AccountSummary | null;
+  trades: Mt5Trade[];
+  mt5: Mt5Status;
 }

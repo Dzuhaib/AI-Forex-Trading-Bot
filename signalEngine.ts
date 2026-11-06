@@ -1,28 +1,28 @@
-/**
+﻿/**
  * Server-side live signal engine for the Untested H1/M30 High-Volume Body + M1 Reversal strategy.
- * - Scans OANDA FX/CFD instruments (FX majors + crosses, gold, WTI, BTC).
- * - Targets 5% of the current account balance per trade with a per-instrument SL and 2R TP.
+ * - Scans FX/CFD instruments (gold, WTI, majors, BTC) on OANDA data.
+ * - Sizes each trade from the connected MT5 account balance (5% risk, per-pair SL, 2R TP).
  * - Watches every open signal against live M1 and S5 candles.
- * - Sizes each simulated trade from account risk, pip value, and the 0.01 lot minimum.
  * - At 50% of TP, moves SL to a 20% TP profit lock and trails it 30% of TP behind the best price.
- * - Persists signals, trades and outcomes so restarts keep history.
+ * - Executes entries, exits and trailing stops on the logged-in MT5 account.
+ * - Dashboard pair selections and the MT5 suffix are persisted across restarts.
  */
 
-import fs from 'fs';
-import path from 'path';
 import type {
   AccountSummary,
-  DummyTrade,
   LiveSignal,
   MarketTicker,
   NearZone,
+  Mt5Status,
+  PairMutationResult,
+  PairsResponse,
   SignalDirection,
   SignalEngineStatus,
   SignalsResponse,
   SignalStatus,
-  Withdrawal,
-  WithdrawalMethod,
 } from './src/types';
+import type { Mt5Broker, Mt5SymbolInfo } from './mt5Broker';
+import type { DashboardState } from './dashboardState';
 
 type Timeframe = 'H1' | 'M30';
 type ZoneType = 'DEMAND' | 'SUPPLY';
@@ -58,6 +58,17 @@ interface TrackedSignal extends LiveSignal {
   breakevenActive: boolean;
 }
 
+interface SignalExecution {
+  signalId: string;
+  symbol: string;
+  volume: number;
+  offset: number;
+  ticket: number | null;
+  closeRequested: boolean;
+  closing: boolean;
+  error: string | null;
+}
+
 interface ScanResult {
   ok: boolean;
   near: NearZone | null;
@@ -90,7 +101,6 @@ interface EngineOptions {
   scanIntervalMs: number;
   watchIntervalMs: number;
   maxTrackHours: number;
-  stateFile: string;
   scanConcurrency: number;
   watchConcurrency: number;
   priceIntervalMs: number;
@@ -98,12 +108,272 @@ interface EngineOptions {
   reentryCooldownMs: number;
   leverage: number;
   pairsOverride: string[];
+  persistedPairs?: string[];
+  persistedSuffix?: string;
   oandaHost: string;
   oandaApiKey: string;
+  mt5Broker: Mt5Broker | null;
 }
 
+// Supported pairs. Active pairs are managed from the dashboard at runtime.
+// OANDA instruments are appended to this catalog after the first successful load.
+const PAIR_CATALOG: string[] = [
+  'XAUUSD',
+  'WTI',
+  'BTCUSD',
+  'EURUSD',
+  'GBPUSD',
+  'AUDUSD',
+  'NZDUSD',
+  'USDJPY',
+  'EURJPY',
+  'GBPJPY',
+  'AUDJPY',
+  'NZDJPY',
+  'CADJPY',
+  'CHFJPY',
+  'USDCAD',
+  'USDCHF',
+  'EURCAD',
+  'GBPCAD',
+  'AUDCAD',
+  'NZDCAD',
+  'EURCHF',
+  'GBPCHF',
+  'AUDCHF',
+  'NZDCHF',
+  'US30',
+  'US500',
+  'USTEC',
+  'UK100',
+  'DE30',
+  'FR40',
+  'EU50',
+  'JP225',
+  'AUS200',
+  'HK50',
+  'IN50',
+  'TWIX',
+  'US2000',
+  'ETHUSD',
+  'BCHUSD',
+  'LTCUSD',
+  'XAGUSD',
+  'XPTUSD',
+  'XPDUSD',
+  'XCUUSD',
+  'BCO',
+  'NATGAS',
+  'USB10Y',
+  'USB30Y',
+  'UK10YB',
+  'DE10YB',
+];
+
+const PAIR_SET = new Set<string>(PAIR_CATALOG);
+
+const PAIR_LABELS: Record<string, string> = {
+  XAUUSD: 'Gold',
+  WTI: 'WTI Crude',
+  BTCUSD: 'Bitcoin',
+  US30: 'US 30',
+  US500: 'US 500',
+  USTEC: 'US Tech 100',
+  UK100: 'UK 100',
+  DE30: 'Germany 30',
+  FR40: 'France 40',
+  EU50: 'Euro 50',
+  JP225: 'Japan 225',
+  AUS200: 'Australia 200',
+  HK50: 'Hong Kong 50',
+  IN50: 'India 50',
+  TWIX: 'Taiwan Index',
+  US2000: 'US 2000',
+  ETHUSD: 'Ethereum',
+  BCHUSD: 'Bitcoin Cash',
+  LTCUSD: 'Litecoin',
+  XAGUSD: 'Silver',
+  XPTUSD: 'Platinum',
+  XPDUSD: 'Palladium',
+  XCUUSD: 'Copper',
+  BCO: 'Brent Crude',
+  NATGAS: 'Natural Gas',
+  USB10Y: 'US 10Y Bond',
+  USB30Y: 'US 30Y Bond',
+  UK10YB: 'UK 10Y Bond',
+  DE10YB: 'Germany 10Y Bond',
+};
+
+const PAIR_ALIASES: Record<string, string[]> = {
+  XAUUSD: ['GOLD', 'XAU'],
+  WTI: ['USOIL', 'WTIUSD', 'XTIUSD', 'CRUDOIL'],
+  BTCUSD: ['BITCOIN'],
+  US30: ['US30USD', 'DOW30', 'DJ30', 'WS30'],
+  US500: ['SPX500', 'SP500', 'US500USD'],
+  USTEC: ['NAS100', 'NASDAQ100', 'USTEC100', 'USTEC100M', 'US100', 'NDX'],
+  UK100: ['FTSE100', 'UK100GBP'],
+  DE30: ['GER30', 'GER40', 'DAX', 'DAX40', 'DE40'],
+  FR40: ['CAC40', 'FR40EUR'],
+  EU50: ['STOXX50', 'EU50EUR'],
+  JP225: ['NIKKEI', 'JP225USD'],
+  AUS200: ['AU200', 'ASX200'],
+  HK50: ['HK33', 'HSI'],
+  IN50: ['NIFTY'],
+  TWIX: ['TW50'],
+  US2000: ['RUSSELL2000'],
+  ETHUSD: ['ETH'],
+  BCHUSD: ['BCH'],
+  LTCUSD: ['LTC'],
+  XAGUSD: ['SILVER'],
+  XPTUSD: ['PLATINUM'],
+  XPDUSD: ['PALLADIUM'],
+  XCUUSD: ['COPPER'],
+  BCO: ['UKOIL', 'BRENT'],
+  NATGAS: ['XNGUSD', 'NGAS'],
+  USB10Y: ['US10Y'],
+  USB30Y: ['US30Y'],
+  UK10YB: ['UK10Y'],
+  DE10YB: ['DE10Y'],
+};
+
+const PAIR_CATEGORIES: Record<string, string> = {
+  XAUUSD: 'metal',
+  WTI: 'energy',
+  BTCUSD: 'crypto',
+  US30: 'index',
+  US500: 'index',
+  USTEC: 'index',
+  UK100: 'index',
+  DE30: 'index',
+  FR40: 'index',
+  EU50: 'index',
+  JP225: 'index',
+  AUS200: 'index',
+  HK50: 'index',
+  IN50: 'index',
+  TWIX: 'index',
+  US2000: 'index',
+  ETHUSD: 'crypto',
+  BCHUSD: 'crypto',
+  LTCUSD: 'crypto',
+  XAGUSD: 'metal',
+  XPTUSD: 'metal',
+  XPDUSD: 'metal',
+  XCUUSD: 'metal',
+  BCO: 'energy',
+  NATGAS: 'energy',
+  USB10Y: 'bond',
+  USB30Y: 'bond',
+  UK10YB: 'bond',
+  DE10YB: 'bond',
+};
+
+// Broker-style names that resolve to a canonical catalog symbol.
+const CANONICAL_ALIASES: Record<string, string> = {
+  US30USD: 'US30',
+  DOW30: 'US30',
+  DJ30: 'US30',
+  WS30: 'US30',
+  SPX500: 'US500',
+  SP500: 'US500',
+  US500USD: 'US500',
+  NAS100: 'USTEC',
+  NASDAQ100: 'USTEC',
+  USTEC100: 'USTEC',
+  US100: 'USTEC',
+  NDX: 'USTEC',
+  FTSE100: 'UK100',
+  UK100GBP: 'UK100',
+  GER30: 'DE30',
+  GER40: 'DE30',
+  DAX: 'DE30',
+  DAX40: 'DE30',
+  DE40: 'DE30',
+  CAC40: 'FR40',
+  FR40EUR: 'FR40',
+  STOXX50: 'EU50',
+  EU50EUR: 'EU50',
+  NIKKEI: 'JP225',
+  JP225USD: 'JP225',
+  AU200: 'AUS200',
+  ASX200: 'AUS200',
+  HK33: 'HK50',
+  HSI: 'HK50',
+  NIFTY: 'IN50',
+  TW50: 'TWIX',
+  RUSSELL2000: 'US2000',
+  GOLD: 'XAUUSD',
+  XAU: 'XAUUSD',
+  SILVER: 'XAGUSD',
+  PLATINUM: 'XPTUSD',
+  PALLADIUM: 'XPDUSD',
+  COPPER: 'XCUUSD',
+  USOIL: 'WTI',
+  WTIUSD: 'WTI',
+  XTIUSD: 'WTI',
+  CRUDOIL: 'WTI',
+  UKOIL: 'BCO',
+  BRENT: 'BCO',
+  XNGUSD: 'NATGAS',
+  NGAS: 'NATGAS',
+  US10Y: 'USB10Y',
+  US30Y: 'USB30Y',
+  UK10Y: 'UK10YB',
+  DE10Y: 'DE10YB',
+  ETH: 'ETHUSD',
+  BCH: 'BCHUSD',
+  LTC: 'LTCUSD',
+};
+
+// Extra MT5-style index variants that share OANDA data but use a different contract size.
+const INSTRUMENT_ALIASES: Record<string, string> = {
+  US30: 'US30_USD',
+  US30X10: 'US30_USD',
+  US500: 'SPX500_USD',
+  US500X100: 'SPX500_USD',
+  USTEC: 'NAS100_USD',
+  USTECX100: 'NAS100_USD',
+};
+
+const QUOTE_CURRENCY_OVERRIDES: Record<string, string> = {
+  UK100: 'GBP',
+  DE30: 'EUR',
+  FR40: 'EUR',
+  EU50: 'EUR',
+  AUS200: 'AUD',
+  HK50: 'HKD',
+};
+
+const DEFAULT_ACTIVE_PAIRS = [
+  'XAUUSD',
+  'WTI',
+  'EURUSD',
+  'GBPUSD',
+  'BTCUSD',
+  'NZDUSD',
+  'NZDJPY',
+  'GBPJPY',
+];
+
+let activeSymbolSuffix = '';
+
+function normalizeSymbolSuffix(value: string | null | undefined): string {
+  return String(value ?? '').trim();
+}
+
+function setActiveSymbolSuffix(value: string): void {
+  activeSymbolSuffix = normalizeSymbolSuffix(value);
+}
+
+function symbolWithSuffix(base: string, suffix: string): string {
+  return `${base}${normalizeSymbolSuffix(suffix)}`;
+}
+
+// OANDA data mapping, keyed by the base symbol (suffix is stripped before lookup).
 const SYMBOL_INSTRUMENTS: Record<string, string> = {
   XAUUSD: 'XAU_USD',
+  WTI: 'WTICO_USD',
+  BTCUSD: 'BTC_USD',
   EURUSD: 'EUR_USD',
   GBPUSD: 'GBP_USD',
   AUDUSD: 'AUD_USD',
@@ -111,15 +381,75 @@ const SYMBOL_INSTRUMENTS: Record<string, string> = {
   USDJPY: 'USD_JPY',
   EURJPY: 'EUR_JPY',
   GBPJPY: 'GBP_JPY',
+  AUDJPY: 'AUD_JPY',
+  NZDJPY: 'NZD_JPY',
+  CADJPY: 'CAD_JPY',
+  CHFJPY: 'CHF_JPY',
+  USDCAD: 'USD_CAD',
   USDCHF: 'USD_CHF',
+  EURCAD: 'EUR_CAD',
+  GBPCAD: 'GBP_CAD',
+  AUDCAD: 'AUD_CAD',
+  NZDCAD: 'NZD_CAD',
+  EURCHF: 'EUR_CHF',
   GBPCHF: 'GBP_CHF',
   AUDCHF: 'AUD_CHF',
-  AUDCAD: 'AUD_CAD',
-  BTCUSD: 'BTC_USD',
-  XTIUSD: 'WTICO_USD',
+  NZDCHF: 'NZD_CHF',
+  US30: 'US30_USD',
+  US500: 'SPX500_USD',
+  USTEC: 'NAS100_USD',
+  UK100: 'UK100_GBP',
+  DE30: 'DE30_EUR',
+  FR40: 'FR40_EUR',
+  EU50: 'EU50_EUR',
+  JP225: 'JP225_USD',
+  AUS200: 'AU200_AUD',
+  HK50: 'HK33_HKD',
+  IN50: 'IN50_USD',
+  TWIX: 'TWIX_USD',
+  US2000: 'US2000_USD',
+  ETHUSD: 'ETH_USD',
+  BCHUSD: 'BCH_USD',
+  LTCUSD: 'LTC_USD',
+  XAGUSD: 'XAG_USD',
+  XPTUSD: 'XPT_USD',
+  XPDUSD: 'XPD_USD',
+  XCUUSD: 'XCU_USD',
+  BCO: 'BCO_USD',
+  NATGAS: 'NATGAS_USD',
+  USB10Y: 'USB10Y_USD',
+  USB30Y: 'USB30Y_USD',
+  UK10YB: 'UK10YB_GBP',
+  DE10YB: 'DE10YB_EUR',
 };
 
-const OANDA_DEFAULT_SYMBOLS = Object.keys(SYMBOL_INSTRUMENTS);
+// Fetched for USD conversion rates when sizing non-USD-quote pairs.
+const QUOTE_RATE_SYMBOLS = ['USDJPY', 'USDCHF', 'USDCAD'];
+
+function registerOandaInstrument(
+  instrumentName: string,
+  displayName: string,
+  pipLocation: unknown
+): string {
+  const base = baseSymbol(instrumentName);
+  if (!base) return '';
+  SYMBOL_INSTRUMENTS[base] = instrumentName;
+
+  if (!(base in PIP_SIZE)) {
+    const location = Number(pipLocation);
+    const pip = Number.isFinite(location) ? 10 ** location : 0.0001;
+    PIP_SIZE[base] = pip > 0 ? pip : 0.0001;
+  }
+  if (!(base in CONTRACT_UNITS)) CONTRACT_UNITS[base] = 100_000;
+  if (!(base in STOP_LOSS_DISTANCE)) {
+    STOP_LOSS_DISTANCE[base] = (base.endsWith('JPY') ? 3.5 : 2.7) * PIP_SIZE[base];
+  }
+
+  PAIR_SET.add(base);
+  if (!PAIR_CATALOG.includes(base)) PAIR_CATALOG.push(base);
+  if (!PAIR_LABELS[base]) PAIR_LABELS[base] = displayName || base;
+  return base;
+}
 
 const GRANULARITY_MS: Record<Interval, number> = {
   M1: 60_000,
@@ -128,10 +458,97 @@ const GRANULARITY_MS: Record<Interval, number> = {
   S5: 5_000,
 };
 
-function toInstrument(symbol: string): string | null {
-  const key = symbol.replace(/[_\s-]/g, '').toUpperCase();
-  return SYMBOL_INSTRUMENTS[key] ?? null;
+function normalizeSymbolBody(value: string): string {
+  return String(value ?? '')
+    .replace(/\.[^.]+$/, '')
+    .replace(/[_\s-]/g, '')
+    .toUpperCase();
 }
+
+function baseSymbol(symbol: string): string {
+  let value = String(symbol ?? '').trim();
+  if (activeSymbolSuffix) {
+    const candidates = activeSymbolSuffix.startsWith('.')
+      ? [activeSymbolSuffix]
+      : [activeSymbolSuffix, `.${activeSymbolSuffix}`];
+    candidates.sort((a, b) => b.length - a.length);
+    for (const candidate of candidates) {
+      if (
+        value.length > candidate.length &&
+        value.toUpperCase().endsWith(candidate.toUpperCase())
+      ) {
+        value = value.slice(0, value.length - candidate.length);
+        break;
+      }
+    }
+  }
+  return normalizeSymbolBody(value);
+}
+
+function normalizePairSymbol(value: unknown): string {
+  const raw = String(value ?? '').trim().toUpperCase();
+  if (PAIR_SET.has(raw)) return raw;
+  const base = baseSymbol(raw);
+  return PAIR_SET.has(base) ? base : '';
+}
+
+function savedPairKey(value: unknown): string {
+  return normalizeSymbolBody(String(value ?? '').trim());
+}
+
+function toInstrument(symbol: string): string | null {
+  return SYMBOL_INSTRUMENTS[baseSymbol(symbol)] ?? null;
+}
+
+function resolveCanonical(base: string): string {
+  if (PAIR_SET.has(base)) return base;
+  return CANONICAL_ALIASES[base] ?? base;
+}
+
+function resolveInstrument(base: string): string | null {
+  return SYMBOL_INSTRUMENTS[base] ?? INSTRUMENT_ALIASES[base] ?? null;
+}
+
+function addPairAlias(base: string, alias: string): void {
+  const value = String(alias || '').trim();
+  if (!value) return;
+  const existing = PAIR_ALIASES[base] ?? [];
+  if (!existing.includes(value)) existing.push(value);
+  PAIR_ALIASES[base] = existing;
+}
+
+function categoryFromPath(path: string): string {
+  const lower = String(path || '').toLowerCase();
+  if (lower.includes('idx') || lower.includes('index')) return 'index';
+  if (lower.includes('crypto')) return 'crypto';
+  if (lower.includes('energ')) return 'energy';
+  if (lower.includes('stock')) return 'stock';
+  if (lower.includes('bond')) return 'bond';
+  if (lower.includes('forex')) return 'fx';
+  return 'other';
+}
+
+function inferMt5Suffix(symbols: Mt5SymbolInfo[]): string {
+  const names = symbols.map((row) => row.name.toLowerCase());
+  if (names.length === 0) return '';
+  const candidates = ['.pro', '.m', '.c', '.a', '.i', 'm', 'c', 'a', 'i'];
+  for (const candidate of candidates) {
+    const matches = names.filter((name) => name.endsWith(candidate)).length;
+    if (matches / names.length >= 0.7) return candidate;
+  }
+  return '';
+}
+
+const STOP_PERCENT_BY_CATEGORY: Record<string, number> = {
+  fx: 0.0003,
+  metal: 0.001,
+  energy: 0.004,
+  index: 0.001,
+  crypto: 0.0035,
+  stock: 0.005,
+  bond: 0.003,
+  other: 0.002,
+};
 
 const HTF_VOL_LOOKBACK = 10;
 const HTF_VOL_MULTIPLIER = 1.5;
@@ -140,7 +557,7 @@ const M1_VOL_MULTIPLIER = 1.2;
 const TOUCH_TOLERANCE_PCT = 0.08;
 const HTF_CACHE_MS = 90_000;
 const MAX_RESOLVED_HISTORY = 400;
-const STARTING_BALANCE = 100;
+const DEFAULT_RISK_BALANCE = 100;
 const MIN_LOT_SIZE = 0.01;
 const MAX_LOT_SIZE = 100;
 const LOT_STEP = 0.01;
@@ -148,6 +565,8 @@ const RISK_PERCENT = 5;
 const REWARD_RISK_RATIO = 2;
 const STOP_LOSS_DISTANCE: Record<string, number> = {
   XAUUSD: 4,
+  WTI: 0.4,
+  BTCUSD: 260,
   EURUSD: 0.00027,
   GBPUSD: 0.00027,
   AUDUSD: 0.00027,
@@ -155,21 +574,66 @@ const STOP_LOSS_DISTANCE: Record<string, number> = {
   USDJPY: 0.035,
   EURJPY: 0.035,
   GBPJPY: 0.035,
+  AUDJPY: 0.035,
+  NZDJPY: 0.035,
+  CADJPY: 0.035,
+  CHFJPY: 0.035,
+  USDCAD: 0.00027,
   USDCHF: 0.00027,
+  EURCAD: 0.00027,
+  GBPCAD: 0.00027,
+  AUDCAD: 0.00027,
+  NZDCAD: 0.00027,
+  EURCHF: 0.00027,
   GBPCHF: 0.00027,
   AUDCHF: 0.00027,
-  AUDCAD: 0.00027,
-  BTCUSD: 260,
-  XTIUSD: 0.4,
+  NZDCHF: 0.00027,
+  US30: 50,
+  US500: 7,
+  USTEC: 25,
+  UK100: 10,
+  DE30: 25,
+  FR40: 10,
+  EU50: 10,
+  JP225: 50,
+  AUS200: 10,
+  HK50: 50,
+  IN50: 30,
+  TWIX: 50,
+  US2000: 2.5,
+  ETHUSD: 8,
+  BCHUSD: 2,
+  LTCUSD: 1.5,
+  XAGUSD: 0.5,
+  XPTUSD: 4,
+  XPDUSD: 4,
+  XCUUSD: 0.05,
+  BCO: 0.5,
+  NATGAS: 0.02,
+  USB10Y: 0.3,
+  USB30Y: 0.3,
+  UK10YB: 0.3,
+  DE10YB: 0.3,
 };
 const BREAKEVEN_TRIGGER_PCT = 50;
 const BREAKEVEN_LOCK_PCT = 20;
 const TRAILING_GAP_PCT = 30;
-const MAX_TRADE_HISTORY = 500;
-const ACCOUNT_CURRENCY = 'USD';
+const EMPTY_MT5_STATUS: Mt5Status = {
+  state: 'DISCONNECTED',
+  connected: false,
+  account: null,
+  terminal: null,
+  positions: [],
+  config: null,
+  connectedAt: null,
+  lastSyncAt: null,
+  lastError: null,
+};
 
 const CONTRACT_UNITS: Record<string, number> = {
   XAUUSD: 100,
+  WTI: 1_000,
+  BTCUSD: 1,
   EURUSD: 100_000,
   GBPUSD: 100_000,
   AUDUSD: 100_000,
@@ -177,16 +641,52 @@ const CONTRACT_UNITS: Record<string, number> = {
   USDJPY: 100_000,
   EURJPY: 100_000,
   GBPJPY: 100_000,
+  AUDJPY: 100_000,
+  NZDJPY: 100_000,
+  CADJPY: 100_000,
+  CHFJPY: 100_000,
+  USDCAD: 100_000,
   USDCHF: 100_000,
+  EURCAD: 100_000,
+  GBPCAD: 100_000,
+  AUDCAD: 100_000,
+  NZDCAD: 100_000,
+  EURCHF: 100_000,
   GBPCHF: 100_000,
   AUDCHF: 100_000,
-  AUDCAD: 100_000,
-  BTCUSD: 1,
-  XTIUSD: 1_000,
+  NZDCHF: 100_000,
+  US30: 1,
+  US500: 1,
+  USTEC: 1,
+  UK100: 1,
+  DE30: 1,
+  FR40: 1,
+  EU50: 1,
+  JP225: 1,
+  AUS200: 1,
+  HK50: 1,
+  IN50: 1,
+  TWIX: 1,
+  US2000: 1,
+  ETHUSD: 1,
+  BCHUSD: 1,
+  LTCUSD: 1,
+  XAGUSD: 5_000,
+  XPTUSD: 100,
+  XPDUSD: 100,
+  XCUUSD: 25_000,
+  BCO: 1_000,
+  NATGAS: 10_000,
+  USB10Y: 1,
+  USB30Y: 1,
+  UK10YB: 1,
+  DE10YB: 1,
 };
 
 const PIP_SIZE: Record<string, number> = {
   XAUUSD: 0.1,
+  WTI: 0.01,
+  BTCUSD: 1,
   EURUSD: 0.0001,
   GBPUSD: 0.0001,
   AUDUSD: 0.0001,
@@ -194,12 +694,46 @@ const PIP_SIZE: Record<string, number> = {
   USDJPY: 0.01,
   EURJPY: 0.01,
   GBPJPY: 0.01,
+  AUDJPY: 0.01,
+  NZDJPY: 0.01,
+  CADJPY: 0.01,
+  CHFJPY: 0.01,
+  USDCAD: 0.0001,
   USDCHF: 0.0001,
+  EURCAD: 0.0001,
+  GBPCAD: 0.0001,
+  AUDCAD: 0.0001,
+  NZDCAD: 0.0001,
+  EURCHF: 0.0001,
   GBPCHF: 0.0001,
   AUDCHF: 0.0001,
-  AUDCAD: 0.0001,
-  BTCUSD: 1,
-  XTIUSD: 0.01,
+  NZDCHF: 0.0001,
+  US30: 1,
+  US500: 0.1,
+  USTEC: 0.1,
+  UK100: 0.1,
+  DE30: 0.1,
+  FR40: 0.1,
+  EU50: 0.1,
+  JP225: 1,
+  AUS200: 1,
+  HK50: 1,
+  IN50: 1,
+  TWIX: 1,
+  US2000: 0.1,
+  ETHUSD: 0.01,
+  BCHUSD: 0.01,
+  LTCUSD: 0.01,
+  XAGUSD: 0.01,
+  XPTUSD: 0.01,
+  XPDUSD: 0.01,
+  XCUUSD: 0.0001,
+  BCO: 0.01,
+  NATGAS: 0.001,
+  USB10Y: 0.01,
+  USB30Y: 0.01,
+  UK10YB: 0.01,
+  DE10YB: 0.01,
 };
 
 function roundMoney(value: number): number {
@@ -211,59 +745,92 @@ function roundLot(value: number): number {
   return Math.min(MAX_LOT_SIZE, Math.max(MIN_LOT_SIZE, Number(stepped.toFixed(2))));
 }
 
-interface QuoteRates {
-  USDJPY: number;
-  USDCHF: number;
-  USDCAD: number;
-}
+type QuoteRates = Record<string, number>;
 
 const FALLBACK_QUOTE_RATES: QuoteRates = {
   USDJPY: 150,
   USDCHF: 0.88,
   USDCAD: 1.36,
+  USDHKD: 7.8,
+  USDSGD: 1.35,
+  USDZAR: 18,
+  USDTRY: 32,
+  USDMXN: 17,
+  USDNOK: 10.7,
+  USDSEK: 10.5,
+  USDPLN: 4,
+  USDCZK: 23,
+  USDDKK: 6.9,
+  USDHUF: 360,
+  USDTHB: 36,
+  USDCNH: 7.25,
 };
 
+const QUOTE_CURRENCIES = [
+  'USDT',
+  'CNH',
+  'USD',
+  'EUR',
+  'GBP',
+  'JPY',
+  'CHF',
+  'CAD',
+  'AUD',
+  'NZD',
+  'HKD',
+  'SGD',
+  'ZAR',
+  'TRY',
+  'MXN',
+  'NOK',
+  'SEK',
+  'PLN',
+  'CZK',
+  'DKK',
+  'HUF',
+  'THB',
+  'ILS',
+  'BRL',
+  'RUB',
+  'INR',
+];
+
+function quoteCurrency(base: string): string {
+  const override = QUOTE_CURRENCY_OVERRIDES[base];
+  if (override) return override;
+  for (const currency of QUOTE_CURRENCIES) {
+    if (base.length > currency.length && base.endsWith(currency)) return currency;
+  }
+  return 'USD';
+}
+
+function quoteRateSymbols(base: string): string[] {
+  const quote = quoteCurrency(base);
+  if (!quote || quote === 'USD' || quote === 'USDT') return [];
+  const direct = `USD${quote}`;
+  const inverse = `${quote}USD`;
+  const symbols: string[] = [];
+  if (SYMBOL_INSTRUMENTS[direct]) symbols.push(direct);
+  if (SYMBOL_INSTRUMENTS[inverse]) symbols.push(inverse);
+  if (symbols.length === 0) symbols.push(direct);
+  return symbols;
+}
+
 function quoteRate(symbol: string, rates: QuoteRates): number {
-  if (symbol.endsWith('JPY')) return rates.USDJPY;
-  if (symbol.endsWith('CHF')) return rates.USDCHF;
-  if (symbol.endsWith('CAD')) return rates.USDCAD;
+  const quote = quoteCurrency(baseSymbol(symbol));
+  if (!quote || quote === 'USD' || quote === 'USDT') return 1;
+  const direct = rates[`USD${quote}`];
+  if (Number.isFinite(direct) && direct > 0) return direct;
+  const inverse = rates[`${quote}USD`];
+  if (Number.isFinite(inverse) && inverse > 0) return 1 / inverse;
   return 1;
 }
 
 function pipValueUsd(symbol: string, rates: QuoteRates): number {
-  const pip = PIP_SIZE[symbol] ?? 0.0001;
-  const units = CONTRACT_UNITS[symbol] ?? 1;
+  const pip = PIP_SIZE[baseSymbol(symbol)] ?? 0.0001;
+  const units = CONTRACT_UNITS[baseSymbol(symbol)] ?? 1;
   const rate = quoteRate(symbol, rates);
   return rate > 0 ? (pip * units) / rate : 0;
-}
-
-function tradePnl(
-  symbol: string,
-  direction: SignalDirection,
-  lotSize: number,
-  entryPrice: number,
-  exitPrice: number,
-  rates: QuoteRates
-): number {
-  const units = (CONTRACT_UNITS[symbol] ?? 1) * lotSize;
-  const diff = direction === 'LONG' ? exitPrice - entryPrice : entryPrice - exitPrice;
-  const rate = quoteRate(symbol, rates);
-  return roundMoney(rate > 0 ? (diff * units) / rate : diff * units);
-}
-
-function normalizeMobileAccount(value: string): string {
-  let digits = value.replace(/\D/g, '');
-  if (digits.startsWith('0092')) digits = digits.slice(2);
-  if (digits.startsWith('92') && digits.length === 12) digits = `0${digits.slice(2)}`;
-  return digits;
-}
-
-function withdrawalReference(method: WithdrawalMethod): string {
-  const prefix = method === 'JAZZCASH' ? 'JC' : 'EP';
-  return `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.random()
-    .toString(36)
-    .slice(2, 6)
-    .toUpperCase()}`;
 }
 
 interface EngineStats {
@@ -315,10 +882,19 @@ async function fetchKlines(
   apiKey: string,
   symbol: string,
   interval: Interval,
-  count: number
+  count: number,
+  fallback?: { broker: Mt5Broker; suffix: string }
 ): Promise<Kline[] | null> {
   const instrument = toInstrument(symbol);
-  if (!instrument) return null;
+  if (!instrument) {
+    if (!fallback?.broker.isConnected()) return null;
+    try {
+      const candles = await fallback.broker.fetchCandles(symbol, interval, count);
+      return candles.length > 0 ? candles : null;
+    } catch {
+      return null;
+    }
+  }
   const limit = Math.max(1, Math.min(Math.ceil(count), 5000));
   const params = new URLSearchParams({
     granularity: interval,
@@ -364,11 +940,12 @@ async function fetchKlinesWindow(
   apiKey: string,
   symbol: string,
   startMs: number,
-  endMs: number
+  endMs: number,
+  fallback?: { broker: Mt5Broker; suffix: string }
 ): Promise<Kline[]> {
   if (endMs <= startMs) return [];
   const count = Math.ceil((Date.now() - startMs) / 60_000) + 3;
-  const batch = await fetchKlines(host, apiKey, symbol, 'M1', count);
+  const batch = await fetchKlines(host, apiKey, symbol, 'M1', count, fallback);
   if (!batch) return [];
   return batch.filter((candle) => candle.openTime >= startMs && candle.openTime <= endMs);
 }
@@ -510,10 +1087,8 @@ export class SignalEngine {
     ambiguous: 0,
     expired: 0,
   };
-  private startingBalance = STARTING_BALANCE;
-  private balance = STARTING_BALANCE;
-  private trades = new Map<string, DummyTrade>();
-  private withdrawals: Withdrawal[] = [];
+  private executions = new Map<string, SignalExecution>();
+  private activePairs: string[] = [];
   private symbols: string[] = [];
   private symbolSource = 'default-static';
   private lastSymbolRefreshAt = 0;
@@ -526,6 +1101,7 @@ export class SignalEngine {
   private scanning = false;
   private watching = false;
   private lastError: string | null = null;
+  private lastExecutionError: string | null = null;
   private marketPrices = new Map<string, number>();
   private marketMeta = new Map<string, { changePct: number; quoteVolume: number }>();
   private htfCache = new Map<string, { h1: Kline[]; m30: Kline[]; at: number }>();
@@ -534,19 +1110,46 @@ export class SignalEngine {
   private priceLoopActive = false;
   private running = false;
   private targetsSynced = false;
-  private saveTimer: NodeJS.Timeout | null = null;
   private scanLoopActive = false;
   private watchLoopActive = false;
+  private brokerQueue: Promise<void> = Promise.resolve();
+  private instrumentsLoadedAt = 0;
+  private instrumentsLoading: Promise<void> | null = null;
+  private mt5SymbolsLoadedAt = 0;
+  private mt5SymbolsLoading: Promise<void> | null = null;
+  private mt5SuffixHint = '';
+  private persistedSuffix: string;
 
   constructor(options: EngineOptions) {
     this.opts = options;
+    this.persistedSuffix = normalizeSymbolSuffix(options.persistedSuffix ?? '');
+    const requested =
+      options.persistedPairs !== undefined
+        ? options.persistedPairs
+        : options.pairsOverride.length > 0
+          ? options.pairsOverride
+          : DEFAULT_ACTIVE_PAIRS;
+    const normalize = options.persistedPairs !== undefined ? savedPairKey : normalizePairSymbol;
+    const seen = new Set<string>();
+    for (const value of requested) {
+      const base = normalize(value);
+      if (!base || seen.has(base)) continue;
+      seen.add(base);
+      this.activePairs.push(base);
+    }
+    this.refreshSymbols();
   }
 
   start(): void {
     if (this.running || !this.opts.enabled) return;
     this.running = true;
     this.startedAt = Date.now();
-    this.loadState();
+    void this.bootstrap();
+  }
+
+  private async bootstrap(): Promise<void> {
+    await this.ensurePairsLoaded();
+    if (!this.running) return;
     void this.runScanLoop();
     void this.runWatchLoop();
     void this.runPriceLoop();
@@ -554,11 +1157,6 @@ export class SignalEngine {
 
   stop(): void {
     this.running = false;
-    if (this.saveTimer) {
-      clearTimeout(this.saveTimer);
-      this.saveTimer = null;
-    }
-    this.saveState();
   }
 
   triggerScan(): boolean {
@@ -567,96 +1165,86 @@ export class SignalEngine {
     return true;
   }
 
-  withdraw(input: {
-    method?: unknown;
-    accountNumber?: unknown;
-    accountTitle?: unknown;
-    amount?: unknown;
-  }):
-    | { ok: true; withdrawal: Withdrawal; balance: number }
-    | { ok: false; error: string } {
-    const method = String(input.method ?? '').trim().toUpperCase();
-    if (method !== 'JAZZCASH' && method !== 'EASYPAISA') {
-      return { ok: false, error: 'Choose JazzCash or Easypaisa as the payout method.' };
-    }
-
-    const accountTitle = String(input.accountTitle ?? '').trim().replace(/\s+/g, ' ');
-    if (accountTitle.length < 3 || accountTitle.length > 60) {
-      return { ok: false, error: 'Enter the account holder name (3-60 characters).' };
-    }
-
-    const accountNumber = normalizeMobileAccount(String(input.accountNumber ?? ''));
-    if (!/^03\d{9}$/.test(accountNumber)) {
-      return {
-        ok: false,
-        error: 'Enter a valid 11-digit mobile account number, e.g. 03001234567.',
-      };
-    }
-
-    const amount = roundMoney(Number(input.amount));
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return { ok: false, error: 'Enter a withdrawal amount greater than zero.' };
-    }
-    if (amount > this.balance) {
-      return {
-        ok: false,
-        error: `Amount exceeds the available balance of $${this.balance.toFixed(2)}.`,
-      };
-    }
-
-    this.balance = roundMoney(this.balance - amount);
-    const requestedAt = Date.now();
-    const withdrawal: Withdrawal = {
-      id: `wd_${requestedAt.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-      method: method as WithdrawalMethod,
-      accountNumber,
-      accountTitle,
-      amount,
-      status: 'PAID',
-      reference: withdrawalReference(method as WithdrawalMethod),
-      requestedAt,
-      requestedAtUtc: isoUtc(requestedAt),
-      balanceAfter: this.balance,
+  resetJournal(): void {
+    this.signals.clear();
+    this.executions.clear();
+    this.lastExecutionError = null;
+    this.lastTriggerBySymbol.clear();
+    this.stats = {
+      total: 0,
+      tp: 0,
+      sl: 0,
+      breakeven: 0,
+      ambiguous: 0,
+      expired: 0,
     };
-    this.withdrawals.unshift(withdrawal);
-    if (this.withdrawals.length > MAX_TRADE_HISTORY) {
-      this.withdrawals.length = MAX_TRADE_HISTORY;
-    }
-    this.saveState();
-    return { ok: true, withdrawal, balance: this.balance };
+    this.refreshSymbols();
   }
 
-  addBalance(input: { amount?: unknown }):
-    | { ok: true; balance: number; startingBalance: number }
-    | { ok: false; error: string } {
-    const amount = roundMoney(Number(input.amount));
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return { ok: false, error: 'Enter an amount greater than zero.' };
+  private riskBase(): number {
+    return this.opts.mt5Broker?.getBalance() ?? DEFAULT_RISK_BALANCE;
+  }
+
+  private symbolSuffix(): string {
+    const configured = normalizeSymbolSuffix(
+      this.opts.mt5Broker?.getStatus().config?.symbolSuffix ?? ''
+    );
+    if (configured) return configured;
+    if (this.persistedSuffix) return this.persistedSuffix;
+    return this.mt5SuffixHint;
+  }
+
+  setSymbolSuffix(value: unknown): void {
+    this.persistedSuffix = normalizeSymbolSuffix(String(value ?? ''));
+    this.refreshSymbols();
+  }
+
+  async detectAndApplySymbolSuffix(): Promise<string | null> {
+    const broker = this.opts.mt5Broker;
+    if (!broker?.isConnected()) return null;
+    try {
+      const symbols = await broker.listSymbols();
+      if (symbols.length === 0) return null;
+      const suffix = inferMt5Suffix(symbols);
+      this.mt5SuffixHint = suffix;
+      broker.setSymbolSuffix(suffix);
+      this.setSymbolSuffix(suffix);
+      return suffix;
+    } catch {
+      return null;
     }
-    if (amount > 1_000_000) {
-      return { ok: false, error: 'The maximum single deposit is $1,000,000.' };
-    }
-    this.startingBalance = roundMoney(this.startingBalance + amount);
-    this.balance = roundMoney(this.balance + amount);
-    this.saveState();
-    return { ok: true, balance: this.balance, startingBalance: this.startingBalance };
+  }
+
+  private candleFallback(): { broker: Mt5Broker; suffix: string } | undefined {
+    return this.opts.mt5Broker
+      ? { broker: this.opts.mt5Broker, suffix: this.symbolSuffix() }
+      : undefined;
+  }
+
+  private async fetchCandles(
+    symbol: string,
+    interval: Interval,
+    count: number
+  ): Promise<Kline[] | null> {
+    return fetchKlines(
+      this.opts.oandaHost,
+      this.opts.oandaApiKey,
+      symbol,
+      interval,
+      count,
+      this.candleFallback()
+    );
   }
 
   private quoteRates(): QuoteRates {
-    const usdjpy = this.marketPrices.get('USDJPY');
-    const usdchf = this.marketPrices.get('USDCHF');
-    const audusd = this.marketPrices.get('AUDUSD');
-    const audcad = this.marketPrices.get('AUDCAD');
-    const derivedCad =
-      audusd && audcad && audusd > 0 && audcad > 0 ? audcad / audusd : null;
-    return {
-      USDJPY: usdjpy && usdjpy > 0 ? usdjpy : FALLBACK_QUOTE_RATES.USDJPY,
-      USDCHF: usdchf && usdchf > 0 ? usdchf : FALLBACK_QUOTE_RATES.USDCHF,
-      USDCAD: derivedCad ?? FALLBACK_QUOTE_RATES.USDCAD,
-    };
+    const rates: QuoteRates = { ...FALLBACK_QUOTE_RATES };
+    for (const [symbol, price] of this.marketPrices) {
+      if (price > 0) rates[symbol] = price;
+    }
+    return rates;
   }
 
-  private riskTargets(symbol: string):
+  private riskTargets(symbol: string, balance = this.riskBase()):
     | {
         riskUsd: number;
         rewardUsd: number;
@@ -665,10 +1253,11 @@ export class SignalEngine {
         lotSize: number;
       }
     | null {
-    const pip = PIP_SIZE[symbol];
-    const slDistance = STOP_LOSS_DISTANCE[symbol];
+    const base = baseSymbol(symbol);
+    const pip = PIP_SIZE[base];
+    const slDistance = STOP_LOSS_DISTANCE[base];
     if (!(pip > 0) || !(slDistance > 0)) return null;
-    const riskUsd = roundMoney(this.balance * (RISK_PERCENT / 100));
+    const riskUsd = roundMoney(balance * (RISK_PERCENT / 100));
     if (!(riskUsd > 0)) return null;
     const pipValue = pipValueUsd(symbol, this.quoteRates());
     if (!(pipValue > 0)) return null;
@@ -695,7 +1284,6 @@ export class SignalEngine {
     const ambiguous = this.stats.ambiguous;
     const expired = this.stats.expired;
     const open = all.filter((s) => s.status === 'OPEN').length;
-    const decided = tp + sl + breakeven;
 
     const status: SignalEngineStatus = {
       running: this.running,
@@ -719,9 +1307,8 @@ export class SignalEngine {
       breakeven,
       ambiguous,
       expired,
-      winRatePct: decided > 0 ? Number((((tp + breakeven) / decided) * 100).toFixed(2)) : 0,
       symbolSource: this.symbolSource,
-      lastError: this.lastError,
+      lastError: this.lastExecutionError ?? this.lastError,
     };
 
     const publicSignals = all
@@ -734,7 +1321,7 @@ export class SignalEngine {
       });
 
     const market: MarketTicker[] = [];
-    const marketSymbols = this.symbols.length > 0 ? this.symbols : OANDA_DEFAULT_SYMBOLS;
+    const marketSymbols = this.symbols;
     for (const symbol of marketSymbols) {
       const price = this.marketPrices.get(symbol);
       if (price === undefined) continue;
@@ -748,47 +1335,7 @@ export class SignalEngine {
       });
     }
 
-    const rates = this.quoteRates();
-    const trades: DummyTrade[] = [...this.trades.values()]
-      .map((trade) => {
-        if (trade.status === 'CLOSED') return { ...trade, unrealizedPnl: 0 };
-        const live = this.marketPrices.get(trade.symbol) ?? trade.entryPrice;
-        return {
-          ...trade,
-          unrealizedPnl: tradePnl(
-            trade.symbol,
-            trade.direction,
-            trade.lotSize,
-            trade.entryPrice,
-            live,
-            rates
-          ),
-        };
-      })
-      .sort((a, b) => {
-        if (a.status === 'OPEN' && b.status !== 'OPEN') return -1;
-        if (a.status !== 'OPEN' && b.status === 'OPEN') return 1;
-        return (b.closedAt ?? b.openedAt) - (a.closedAt ?? a.openedAt);
-      });
-
-    const unrealizedPnl = roundMoney(
-      trades.reduce((sum, trade) => (trade.status === 'OPEN' ? sum + trade.unrealizedPnl : sum), 0)
-    );
-    const withdrawnTotal = roundMoney(
-      this.withdrawals.reduce((sum, withdrawal) => sum + withdrawal.amount, 0)
-    );
-    const account: AccountSummary = {
-      startingBalance: this.startingBalance,
-      balance: this.balance,
-      equity: roundMoney(this.balance + unrealizedPnl),
-      unrealizedPnl,
-      realizedPnl: roundMoney(this.balance - this.startingBalance + withdrawnTotal),
-      withdrawnTotal,
-      openTrades: trades.filter((trade) => trade.status === 'OPEN').length,
-      closedTrades: trades.filter((trade) => trade.status === 'CLOSED').length,
-      riskPercent: RISK_PERCENT,
-      currency: ACCOUNT_CURRENCY,
-    };
+    const mt5Snapshot = this.opts.mt5Broker?.getAccountSnapshot();
 
     return {
       generatedAt: now,
@@ -796,9 +1343,9 @@ export class SignalEngine {
       signals: publicSignals,
       nearZones: this.nearZones,
       market,
-      account,
-      trades,
-      withdrawals: [...this.withdrawals].sort((a, b) => b.requestedAt - a.requestedAt),
+      account: mt5Snapshot?.account ?? null,
+      trades: mt5Snapshot?.trades ?? [],
+      mt5: this.opts.mt5Broker?.getStatus() ?? EMPTY_MT5_STATUS,
     };
   }
 
@@ -833,17 +1380,34 @@ export class SignalEngine {
   }
 
   private async refreshMarketPrices(): Promise<void> {
-    const symbols = this.symbols.length > 0 ? this.symbols : OANDA_DEFAULT_SYMBOLS;
+    const symbols = [...new Set([
+      ...this.symbols,
+      ...[...this.signals.values()]
+        .filter((signal) => signal.status === 'OPEN')
+        .map((signal) => signal.symbol),
+    ])];
+    const quoteSymbols = new Set<string>(QUOTE_RATE_SYMBOLS);
+    for (const symbol of symbols) {
+      for (const rate of quoteRateSymbols(baseSymbol(symbol))) quoteSymbols.add(rate);
+    }
+    for (const quote of quoteSymbols) {
+      if (!symbols.includes(quote)) symbols.push(quote);
+    }
     const now = Date.now();
     const results = await Promise.all(
       symbols.map(async (symbol) => {
         try {
+          if (!toInstrument(symbol) && this.opts.mt5Broker?.isConnected()) {
+            const quote = await this.opts.mt5Broker.getQuote(symbol);
+            return quote ? { symbol, price: quote.price } : null;
+          }
           const candles = await fetchKlines(
             this.opts.oandaHost,
             this.opts.oandaApiKey,
             symbol,
             'S5',
-            1
+            1,
+            this.candleFallback()
           );
           const last = candles?.[candles.length - 1];
           return last && Number.isFinite(last.close) && last.close > 0
@@ -881,7 +1445,8 @@ export class SignalEngine {
   private applyRiskTargets(): void {
     for (const signal of this.signals.values()) {
       if (signal.status !== 'OPEN') continue;
-      if (!SYMBOL_INSTRUMENTS[signal.symbol]) continue;
+      const base = baseSymbol(signal.symbol);
+      if (!(PIP_SIZE[base] > 0) || !(STOP_LOSS_DISTANCE[base] > 0)) continue;
       const targets = this.riskTargets(signal.symbol);
       if (!targets) continue;
       signal.initialRiskDistance = targets.slDistance;
@@ -904,33 +1469,246 @@ export class SignalEngine {
       signal.riskPct = Number(((targets.slDistance / signal.entry) * 100).toFixed(3));
       signal.rewardPct = Number(((targets.tpDistance / signal.entry) * 100).toFixed(3));
       signal.roePct = Number((signal.rewardPct * signal.leverage).toFixed(2));
-      const trade = this.trades.get(signal.id);
-      if (trade && trade.status === 'OPEN') {
-        trade.lotSize = targets.lotSize;
-        trade.stopLoss = signal.stopLoss;
-        trade.takeProfit = signal.takeProfit;
+      const execution = this.executions.get(signal.id);
+      if (execution && execution.ticket === null) {
+        execution.volume = targets.lotSize;
       }
     }
-    this.scheduleSave();
   }
 
-  private async refreshSymbols(): Promise<void> {
-    const wanted = new Set(
-      this.opts.pairsOverride.map((symbol) => toInstrument(symbol)).filter(Boolean)
-    );
-    const override = OANDA_DEFAULT_SYMBOLS.filter((symbol) => wanted.has(toInstrument(symbol)));
-    this.symbols = override.length > 0 ? override : OANDA_DEFAULT_SYMBOLS;
+  async ensurePairsLoaded(force = false): Promise<void> {
+    const oandaFresh =
+      this.instrumentsLoadedAt > 0 &&
+      Date.now() - this.instrumentsLoadedAt < 6 * 60 * 60 * 1000;
+    if (this.opts.oandaApiKey && (force || !oandaFresh)) {
+      if (!this.instrumentsLoading) {
+        this.instrumentsLoading = this.loadOandaInstruments().finally(() => {
+          this.instrumentsLoading = null;
+        });
+      }
+      await this.instrumentsLoading;
+    }
+
+    const broker = this.opts.mt5Broker;
+    if (!broker?.isConnected()) return;
+    const mt5Fresh =
+      this.mt5SymbolsLoadedAt > 0 &&
+      Date.now() - this.mt5SymbolsLoadedAt < 10 * 60 * 1000;
+    if (!force && mt5Fresh) return;
+    if (!this.mt5SymbolsLoading) {
+      this.mt5SymbolsLoading = this.loadMt5Symbols().finally(() => {
+        this.mt5SymbolsLoading = null;
+      });
+    }
+    await this.mt5SymbolsLoading;
+  }
+
+  private async loadMt5Symbols(): Promise<void> {
+    const broker = this.opts.mt5Broker;
+    if (!broker?.isConnected()) return;
+    let symbols: Mt5SymbolInfo[] = [];
+    try {
+      symbols = await broker.listSymbols();
+    } catch {
+      return;
+    }
+    if (symbols.length === 0) return;
+    this.mt5SuffixHint = inferMt5Suffix(symbols);
+    for (const row of symbols) this.registerMt5Symbol(row);
+    this.mt5SymbolsLoadedAt = Date.now();
+    this.refreshSymbols();
+  }
+
+  private registerMt5Symbol(row: Mt5SymbolInfo): void {
+    const rawName = String(row.name ?? '').trim();
+    if (!rawName) return;
+    let base = baseSymbol(rawName);
+    const hint = this.mt5SuffixHint.toLowerCase();
+    if (hint && rawName.toLowerCase().endsWith(hint) && rawName.length > hint.length) {
+      base = normalizeSymbolBody(rawName.slice(0, rawName.length - hint.length));
+    }
+    if (!base) return;
+
+    let key = base;
+    let instrument = resolveInstrument(base);
+    if (!instrument) {
+      const canonical = resolveCanonical(base);
+      if (PAIR_SET.has(canonical) || resolveInstrument(canonical)) {
+        key = canonical;
+        instrument = resolveInstrument(canonical);
+      }
+    }
+
+    if (PAIR_SET.has(key)) {
+      addPairAlias(key, rawName);
+      addPairAlias(key, row.path);
+      if (key === base && row.contractSize > 0) {
+        CONTRACT_UNITS[key] = row.contractSize;
+      }
+      return;
+    }
+
+    const category = categoryFromPath(row.path);
+    const price = row.mid || row.last || row.bid || row.ask || 0;
+    const root = key.replace(/(X10|X100)$/i, '');
+    const inheritedStop = STOP_LOSS_DISTANCE[root] ?? STOP_LOSS_DISTANCE[key];
+    const percent = STOP_PERCENT_BY_CATEGORY[category] ?? 0.002;
+    const fallbackStop = Math.max(Number(row.point) * 500, 0.0001);
+    const stopDistance =
+      inheritedStop && inheritedStop > 0
+        ? inheritedStop
+        : price > 0
+          ? price * percent
+          : fallbackStop;
+    const units = row.contractSize > 0 ? row.contractSize : CONTRACT_UNITS[key] ?? 1;
+
+    if (instrument) SYMBOL_INSTRUMENTS[key] = instrument;
+    PIP_SIZE[key] = row.point > 0 ? row.point : 0.0001;
+    CONTRACT_UNITS[key] = units;
+    STOP_LOSS_DISTANCE[key] = stopDistance;
+    PAIR_SET.add(key);
+    PAIR_CATALOG.push(key);
+    PAIR_LABELS[key] = String(row.description || rawName);
+    PAIR_CATEGORIES[key] = category;
+    PAIR_ALIASES[key] = [rawName, row.path];
+    if (/X100$/i.test(key)) {
+      addPairAlias(key, key.replace(/X100$/i, '100'));
+      addPairAlias(key, `${key.replace(/X100$/i, '')}100M`);
+    } else if (/X10$/i.test(key)) {
+      addPairAlias(key, key.replace(/X10$/i, '10'));
+    }
+  }
+
+  private async loadOandaInstruments(): Promise<void> {
+    try {
+      const accountId = await this.fetchOandaAccountId();
+      if (!accountId) return;
+
+      const payload = (await this.fetchOandaWithRetry(
+        `${this.opts.oandaHost}/v3/accounts/${encodeURIComponent(accountId)}/instruments`,
+        12000,
+        3
+      )) as { instruments?: Array<Record<string, unknown>> };
+      if (!Array.isArray(payload?.instruments) || payload.instruments.length === 0) return;
+
+      let added = 0;
+      for (const row of payload.instruments) {
+        if (!row || typeof row !== 'object') continue;
+        if (String(row.type ?? '') !== 'CURRENCY') continue;
+        const name = String(row.name ?? '');
+        if (!name) continue;
+        const before = PAIR_SET.size;
+        registerOandaInstrument(
+          name,
+          String(row.displayName ?? name),
+          row.pipLocation
+        );
+        if (PAIR_SET.size > before) added += 1;
+      }
+      this.instrumentsLoadedAt = Date.now();
+      if (added > 0) this.refreshSymbols();
+    } catch {
+      // Keep the built-in catalog when OANDA is temporarily unavailable.
+    }
+  }
+
+  private async fetchOandaAccountId(): Promise<string | null> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const accounts = (await fetchOandaJson(
+          `${this.opts.oandaHost}/v3/accounts`,
+          this.opts.oandaApiKey,
+          6000
+        )) as { accounts?: Array<{ id?: unknown }> };
+        const accountId = accounts?.accounts?.find(
+          (account) => typeof account?.id === 'string' && account.id.length > 0
+        )?.id;
+        if (typeof accountId === 'string' && accountId) return accountId;
+      } catch {
+        // Retry; OANDA occasionally returns transient gateway errors.
+      }
+      if (attempt < 2) await sleep(800 * (attempt + 1));
+    }
+    return null;
+  }
+
+  private async fetchOandaWithRetry(
+    url: string,
+    timeoutMs: number,
+    attempts: number
+  ): Promise<unknown> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        return await fetchOandaJson(url, this.opts.oandaApiKey, timeoutMs);
+      } catch (error) {
+        lastError = error;
+      }
+      if (attempt < attempts - 1) await sleep(800 * (attempt + 1));
+    }
+    throw lastError instanceof Error ? lastError : new Error('OANDA request failed.');
+  }
+
+  refreshSymbols(): void {
+    const suffix = this.symbolSuffix();
+    setActiveSymbolSuffix(suffix);
+    this.symbols = this.activePairs.map((base) => symbolWithSuffix(base, suffix));
     this.symbolSource = 'OANDA';
     this.lastSymbolRefreshAt = Date.now();
+  }
+
+  getPairs(): PairsResponse {
+    return {
+      catalog: PAIR_CATALOG.map((symbol) => ({
+        symbol,
+        name: PAIR_LABELS[symbol] ?? symbol,
+        active: this.activePairs.includes(symbol),
+        aliases: PAIR_ALIASES[symbol] ?? [],
+        category: PAIR_CATEGORIES[symbol] ?? 'fx',
+      })),
+      active: [...this.activePairs],
+    };
+  }
+
+  addPair(value: unknown): PairMutationResult {
+    const base = normalizePairSymbol(value);
+    if (!base) {
+      return {
+        ok: false,
+        error: 'That pair is not supported.',
+        pairs: this.getPairs(),
+      };
+    }
+    if (!this.activePairs.includes(base)) {
+      this.activePairs.push(base);
+      this.refreshSymbols();
+    }
+    return { ok: true, pairs: this.getPairs() };
+  }
+
+  removePair(value: unknown): PairMutationResult {
+    const base = normalizePairSymbol(value) || savedPairKey(value);
+    const index = base ? this.activePairs.indexOf(base) : -1;
+    if (index === -1) {
+      return {
+        ok: false,
+        error: 'That pair is not active.',
+        pairs: this.getPairs(),
+      };
+    }
+    this.activePairs.splice(index, 1);
+    this.refreshSymbols();
+    return { ok: true, pairs: this.getPairs() };
   }
 
   private async scanOnce(): Promise<void> {
     if (this.scanning || !this.running) return;
     this.scanning = true;
+    this.flushPendingExecutions();
     const started = Date.now();
     try {
-      if (this.symbols.length === 0) {
-        await this.refreshSymbols();
+      if (this.symbols.length === 0 && this.activePairs.length > 0) {
+        this.refreshSymbols();
       }
 
       const pairs = this.symbols;
@@ -960,7 +1738,6 @@ export class SignalEngine {
       this.lastError = error instanceof Error ? error.message : String(error);
     } finally {
       this.scanning = false;
-      this.scheduleSave();
     }
   }
 
@@ -969,13 +1746,9 @@ export class SignalEngine {
     const now = Date.now();
     const needHtf = !cached || now - cached.at > HTF_CACHE_MS;
     const [m1, m30, h1] = await Promise.all([
-      fetchKlines(this.opts.oandaHost, this.opts.oandaApiKey, symbol, 'M1', 35),
-      needHtf
-        ? fetchKlines(this.opts.oandaHost, this.opts.oandaApiKey, symbol, 'M30', 60)
-        : Promise.resolve(cached.m30),
-      needHtf
-        ? fetchKlines(this.opts.oandaHost, this.opts.oandaApiKey, symbol, 'H1', 60)
-        : Promise.resolve(cached.h1),
+      this.fetchCandles(symbol, 'M1', 35),
+      needHtf ? this.fetchCandles(symbol, 'M30', 60) : Promise.resolve(cached.m30),
+      needHtf ? this.fetchCandles(symbol, 'H1', 60) : Promise.resolve(cached.h1),
     ]);
 
     if (!m1 || !m30 || !h1 || m1.length < 20 || m30.length < 20 || h1.length < 20) {
@@ -1183,77 +1956,142 @@ export class SignalEngine {
     this.lastTriggerBySymbol.set(signal.symbol, signal.triggerCandleOpen);
     this.signals.set(tracked.id, tracked);
     this.stats.total += 1;
-    this.openDummyTrade(tracked);
+    this.openMt5Execution(tracked);
     this.trimResolvedHistory();
-    this.scheduleSave();
   }
 
-  private openDummyTrade(signal: TrackedSignal): void {
-    if (this.trades.has(signal.id)) return;
+  private openMt5Execution(signal: TrackedSignal): void {
+    const broker = this.opts.mt5Broker;
+    if (!broker?.isConnected()) return;
+    if (this.executions.has(signal.id)) return;
     const targets = this.riskTargets(signal.symbol);
-    this.trades.set(signal.id, {
-      id: signal.id,
+    const execution: SignalExecution = {
       signalId: signal.id,
       symbol: signal.symbol,
-      direction: signal.direction,
-      lotSize: targets?.lotSize ?? MIN_LOT_SIZE,
-      entryPrice: signal.entry,
-      stopLoss: signal.stopLoss,
-      takeProfit: signal.takeProfit,
-      openedAt: signal.signalTime,
-      openedAtUtc: signal.signalTimeUtc,
-      closedAt: null,
-      closedAtUtc: null,
-      exitPrice: null,
-      status: 'OPEN',
-      outcome: null,
-      pnl: 0,
-      unrealizedPnl: 0,
-      balanceAfter: null,
-    });
+      volume: targets?.lotSize ?? MIN_LOT_SIZE,
+      offset: 0,
+      ticket: null,
+      closeRequested: false,
+      closing: false,
+      error: null,
+    };
+    this.executions.set(signal.id, execution);
+    this.enqueueBroker(() => this.executeMt5Entry(execution));
   }
 
-  private closeDummyTrade(
+  private requestExecutionClose(signal: TrackedSignal): void {
+    const execution = this.executions.get(signal.id);
+    if (!execution) return;
+    execution.closeRequested = true;
+    this.tryCloseExecution(execution);
+  }
+
+  private tryCloseExecution(execution: SignalExecution): void {
+    if (!execution.closeRequested || execution.ticket === null || execution.closing) return;
+    if (!this.opts.mt5Broker?.isConnected()) return;
+    execution.closing = true;
+    this.enqueueBroker(() => this.executeMt5Close(execution));
+  }
+
+  private flushPendingExecutions(): void {
+    if (!this.opts.mt5Broker?.isConnected()) return;
+    for (const execution of this.executions.values()) {
+      if (execution.closeRequested) this.tryCloseExecution(execution);
+    }
+  }
+
+  private enqueueBroker(operation: () => Promise<void>): void {
+    this.brokerQueue = this.brokerQueue
+      .then(operation)
+      .catch((error: unknown) => {
+        this.lastError = error instanceof Error ? error.message : 'MT5 execution failed.';
+      });
+  }
+
+  private async executeMt5Entry(execution: SignalExecution): Promise<void> {
+    const broker = this.opts.mt5Broker;
+    if (!broker?.isConnected() || execution.ticket !== null) return;
+    const signal = this.signals.get(execution.signalId);
+    if (!signal) {
+      this.executions.delete(execution.signalId);
+      return;
+    }
+    try {
+      const quote = await broker.getQuote(signal.symbol);
+      if (!quote) {
+        throw new Error('MT5 quote unavailable for the broker symbol.');
+      }
+      execution.offset = quote.price - signal.entry;
+      const result = await broker.placeOrder({
+        symbol: signal.symbol,
+        direction: signal.direction,
+        volume: execution.volume,
+        sl: signal.stopLoss + execution.offset,
+        tp: signal.takeProfit + execution.offset,
+      });
+      execution.ticket = result.ticket;
+      execution.error = null;
+      this.lastExecutionError = null;
+      this.lastError = null;
+      if (execution.closeRequested) this.tryCloseExecution(execution);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'MT5 entry failed.';
+      execution.error = message;
+      this.lastExecutionError = `MT5 ${signal.symbol} entry: ${message}`;
+      this.lastError = this.lastExecutionError;
+      this.executions.delete(execution.signalId);
+    }
+  }
+
+  private async executeMt5Close(execution: SignalExecution): Promise<void> {
+    const broker = this.opts.mt5Broker;
+    const ticket = execution.ticket;
+    if (!broker?.isConnected() || ticket === null) {
+      execution.closing = false;
+      return;
+    }
+    try {
+      const result = await broker.closePosition(ticket);
+      this.executions.delete(execution.signalId);
+      this.lastError = result.closed ? null : (result.message ?? null);
+      this.trimResolvedHistory();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'MT5 close failed.';
+      execution.error = message;
+      execution.closing = false;
+      this.lastError = `MT5 ${execution.symbol} close: ${message}`;
+    }
+  }
+
+  private async executeMt5Modify(
     signal: TrackedSignal,
-    status: SignalStatus,
-    price: number,
-    atMs: number
-  ): void {
-    const trade = this.trades.get(signal.id);
-    if (!trade || trade.status !== 'OPEN') return;
-    const pnl = tradePnl(
-      trade.symbol,
-      trade.direction,
-      trade.lotSize,
-      trade.entryPrice,
-      price,
-      this.quoteRates()
-    );
-    this.balance = roundMoney(this.balance + pnl);
-    trade.status = 'CLOSED';
-    trade.outcome = status;
-    trade.closedAt = atMs;
-    trade.closedAtUtc = isoUtc(atMs);
-    trade.exitPrice = price;
-    trade.pnl = pnl;
-    trade.unrealizedPnl = 0;
-    trade.balanceAfter = this.balance;
-    this.trimTradeHistory();
-  }
-
-  private trimTradeHistory(): void {
-    const closed = [...this.trades.values()]
-      .filter((trade) => trade.status === 'CLOSED')
-      .sort((a, b) => (a.closedAt ?? 0) - (b.closedAt ?? 0));
-    const excess = closed.length - MAX_TRADE_HISTORY;
-    for (let i = 0; i < excess; i += 1) {
-      this.trades.delete(closed[i].id);
+    execution: SignalExecution
+  ): Promise<void> {
+    const broker = this.opts.mt5Broker;
+    const ticket = execution.ticket;
+    if (!broker?.isConnected() || ticket === null) return;
+    try {
+      const result = await broker.modifyPosition(
+        ticket,
+        signal.stopLoss + execution.offset,
+        signal.takeProfit + execution.offset
+      );
+      if (result.modified) {
+        execution.error = null;
+        this.lastError = null;
+      } else {
+        execution.error = result.message ?? 'MT5 position is no longer open.';
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'MT5 stop update failed.';
+      execution.error = message;
+      this.lastError = `MT5 ${signal.symbol} stop update: ${message}`;
     }
   }
 
   private trimResolvedHistory(): void {
     const resolved = [...this.signals.values()]
-      .filter((signal) => signal.status !== 'OPEN')
+      .filter((signal) => signal.status !== 'OPEN' && !this.executions.has(signal.id))
       .sort((a, b) => (a.resolvedAt ?? 0) - (b.resolvedAt ?? 0));
     const excess = resolved.length - MAX_RESOLVED_HISTORY;
     for (let i = 0; i < excess; i += 1) {
@@ -1263,6 +2101,7 @@ export class SignalEngine {
 
   private async watchOnce(): Promise<void> {
     if (this.watching || !this.running) return;
+    this.flushPendingExecutions();
     const groups = new Map<string, TrackedSignal[]>();
     for (const signal of this.signals.values()) {
       if (signal.status !== 'OPEN') continue;
@@ -1309,7 +2148,8 @@ export class SignalEngine {
         this.opts.oandaApiKey,
         symbol,
         start,
-        now
+        now,
+        this.candleFallback()
       );
       for (const signal of active) {
         if (signal.status !== 'OPEN') continue;
@@ -1368,13 +2208,7 @@ export class SignalEngine {
     const end = Math.min(now, signal.signalMinuteEnd);
     if (end > signal.signalTime) {
       const count = Math.ceil((Date.now() - signal.signalTime) / 5000) + 2;
-      const seconds = await fetchKlines(
-        this.opts.oandaHost,
-        this.opts.oandaApiKey,
-        signal.symbol,
-        'S5',
-        count
-      );
+      const seconds = await this.fetchCandles(signal.symbol, 'S5', count);
       const window = seconds?.filter(
         (candle) => candle.openTime >= signal.signalTime && candle.openTime <= end
       );
@@ -1442,16 +2276,13 @@ export class SignalEngine {
     if (!(tpDistance > 0)) return;
 
     const favourablePrice = signal.direction === 'LONG' ? candle.high : candle.low;
-    const previousBest = signal.bestPrice;
     signal.bestPrice =
       signal.direction === 'LONG'
         ? Math.max(signal.bestPrice, favourablePrice)
         : Math.min(signal.bestPrice, favourablePrice);
-    let changed = signal.bestPrice !== previousBest;
 
     const progress = Math.abs(signal.bestPrice - signal.entry);
     if (progress < tpDistance * (BREAKEVEN_TRIGGER_PCT / 100)) {
-      if (changed) this.scheduleSave();
       return;
     }
 
@@ -1463,17 +2294,14 @@ export class SignalEngine {
 
     if (!signal.breakevenActive) {
       signal.breakevenActive = true;
-      changed = true;
     }
     if (nextStop !== signal.stopLoss) {
       signal.stopLoss = nextStop;
-      const trade = this.trades.get(signal.id);
-      if (trade && trade.status === 'OPEN') {
-        trade.stopLoss = nextStop;
+      const execution = this.executions.get(signal.id);
+      if (execution && execution.ticket !== null) {
+        this.enqueueBroker(() => this.executeMt5Modify(signal, execution));
       }
-      changed = true;
     }
-    if (changed) this.scheduleSave();
   }
 
   private hitLevels(
@@ -1499,13 +2327,7 @@ export class SignalEngine {
   ): Promise<boolean> {
     const limit = Math.min(endMs, candle.closeTime);
     const count = Math.ceil((Date.now() - candle.openTime) / 5000) + 2;
-    const seconds = await fetchKlines(
-      this.opts.oandaHost,
-      this.opts.oandaApiKey,
-      signal.symbol,
-      'S5',
-      count
-    );
+    const seconds = await this.fetchCandles(signal.symbol, 'S5', count);
     const window = seconds?.filter(
       (item) => item.openTime >= candle.openTime && item.openTime <= limit
     );
@@ -1544,14 +2366,13 @@ export class SignalEngine {
     signal.livePrice = price;
     signal.liveUpdatedAt = atMs;
     signal.holdMinutes = Number(((atMs - signal.signalTime) / 60_000).toFixed(2));
-    this.closeDummyTrade(signal, status, price, atMs);
+    this.requestExecutionClose(signal);
     if (status === 'TP_HIT') this.stats.tp += 1;
     else if (status === 'SL_HIT') this.stats.sl += 1;
     else if (status === 'BREAKEVEN_HIT') this.stats.breakeven += 1;
     else if (status === 'AMBIGUOUS') this.stats.ambiguous += 1;
     else if (status === 'EXPIRED') this.stats.expired += 1;
     this.trimResolvedHistory();
-    this.scheduleSave();
   }
 
   private toPublicSignal(signal: TrackedSignal, now: number): LiveSignal {
@@ -1614,342 +2435,12 @@ export class SignalEngine {
     };
   }
 
-  private scheduleSave(): void {
-    if (this.saveTimer) return;
-    this.saveTimer = setTimeout(() => {
-      this.saveTimer = null;
-      this.saveState();
-    }, 1500);
-  }
-
-  private saveState(): void {
-    try {
-      const dir = path.dirname(this.opts.stateFile);
-      fs.mkdirSync(dir, { recursive: true });
-      const payload = {
-        version: 7,
-        dataSource: 'oanda',
-        savedAt: Date.now(),
-        stats: this.stats,
-        startingBalance: this.startingBalance,
-        balance: this.balance,
-        signals: [...this.signals.values()],
-        trades: [...this.trades.values()],
-        withdrawals: this.withdrawals,
-        lastTriggerBySymbol: Object.fromEntries(this.lastTriggerBySymbol),
-      };
-      const tmp = `${this.opts.stateFile}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(payload), 'utf8');
-      fs.renameSync(tmp, this.opts.stateFile);
-    } catch (error) {
-      console.error('Signal state save failed:', error);
-    }
-  }
-
-  private loadState(): void {
-    if (!fs.existsSync(this.opts.stateFile)) return;
-    try {
-      const raw = JSON.parse(fs.readFileSync(this.opts.stateFile, 'utf8')) as {
-        dataSource?: string;
-        signals?: unknown[];
-        trades?: unknown[];
-        withdrawals?: unknown[];
-        lastTriggerBySymbol?: Record<string, unknown>;
-        stats?: Partial<EngineStats>;
-        startingBalance?: number;
-        balance?: number;
-      };
-      if (raw.dataSource !== 'oanda') {
-        this.signals.clear();
-        this.lastTriggerBySymbol.clear();
-        this.stats = {
-          total: 0,
-          tp: 0,
-          sl: 0,
-          breakeven: 0,
-          ambiguous: 0,
-          expired: 0,
-        };
-        this.trades.clear();
-        this.withdrawals = [];
-        this.balance = this.startingBalance;
-        return;
-      }
-      const storedStarting = Number(raw.startingBalance);
-      if (Number.isFinite(storedStarting) && storedStarting > 0) {
-        this.startingBalance = storedStarting;
-      }
-      const storedBalance = Number(raw.balance);
-      this.balance = Number.isFinite(storedBalance) ? storedBalance : this.startingBalance;
-      if (Array.isArray(raw.trades)) {
-        for (const item of raw.trades) {
-          const trade = this.normalizeStoredTrade(item);
-          if (!trade) continue;
-          if (trade.status === 'OPEN' && !SYMBOL_INSTRUMENTS[trade.symbol]) continue;
-          this.trades.set(trade.id, trade);
-        }
-      }
-      if (Array.isArray(raw.withdrawals)) {
-        for (const item of raw.withdrawals) {
-          const withdrawal = this.normalizeStoredWithdrawal(item);
-          if (withdrawal) this.withdrawals.push(withdrawal);
-        }
-        this.withdrawals.sort((a, b) => b.requestedAt - a.requestedAt);
-      }
-      let migratedBreakeven = 0;
-      if (Array.isArray(raw.signals)) {
-        for (const item of raw.signals) {
-          const tracked = this.normalizeStoredSignal(item);
-          if (!tracked || !toInstrument(tracked.symbol)) continue;
-          if (tracked.status === 'SL_HIT' && this.isBreakevenStop(tracked)) {
-            tracked.status = 'BREAKEVEN_HIT';
-            tracked.verdict = verdictFor('BREAKEVEN_HIT');
-            migratedBreakeven += 1;
-          }
-          this.signals.set(tracked.id, tracked);
-        }
-      }
-      if (raw.lastTriggerBySymbol && typeof raw.lastTriggerBySymbol === 'object') {
-        for (const [symbol, value] of Object.entries(raw.lastTriggerBySymbol)) {
-          if (!toInstrument(symbol)) continue;
-          const ms = Number(value);
-          if (Number.isFinite(ms)) this.lastTriggerBySymbol.set(symbol, ms);
-        }
-      }
-      const newestOpen = new Map<string, TrackedSignal>();
-      for (const signal of this.signals.values()) {
-        if (signal.status !== 'OPEN') continue;
-        const current = newestOpen.get(signal.symbol);
-        if (!current || signal.signalTime > current.signalTime) {
-          newestOpen.set(signal.symbol, signal);
-        }
-      }
-      const now = Date.now();
-      for (const signal of this.signals.values()) {
-        if (signal.status !== 'OPEN' || newestOpen.get(signal.symbol) === signal) continue;
-        signal.status = 'EXPIRED';
-        signal.verdict = verdictFor('EXPIRED');
-        signal.resolutionPrice = signal.entry;
-        signal.resolvedAt = now;
-        signal.resolvedAtUtc = isoUtc(now);
-        signal.livePrice = signal.entry;
-        signal.liveUpdatedAt = now;
-        signal.holdMinutes = Number(((now - signal.signalTime) / 60_000).toFixed(2));
-      }
-      const derived: EngineStats = {
-        total: 0,
-        tp: 0,
-        sl: 0,
-        breakeven: 0,
-        ambiguous: 0,
-        expired: 0,
-      };
-      for (const signal of this.signals.values()) {
-        derived.total += 1;
-        if (signal.status === 'TP_HIT') derived.tp += 1;
-        else if (signal.status === 'SL_HIT') derived.sl += 1;
-        else if (signal.status === 'BREAKEVEN_HIT') derived.breakeven += 1;
-        else if (signal.status === 'AMBIGUOUS') derived.ambiguous += 1;
-        else if (signal.status === 'EXPIRED') derived.expired += 1;
-      }
-      const stored = raw.stats;
-      const storedSl = Math.max(0, (Number(stored?.sl) || 0) - migratedBreakeven);
-      const storedBreakeven = (Number(stored?.breakeven) || 0) + migratedBreakeven;
-      this.stats = {
-        total: Math.max(Number(stored?.total) || 0, derived.total),
-        tp: Math.max(Number(stored?.tp) || 0, derived.tp),
-        sl: Math.max(storedSl, derived.sl),
-        breakeven: Math.max(storedBreakeven, derived.breakeven),
-        ambiguous: Math.max(Number(stored?.ambiguous) || 0, derived.ambiguous),
-        expired: Math.max(Number(stored?.expired) || 0, derived.expired),
-      };
-      this.syncTradesWithSignals();
-    } catch (error) {
-      console.error('Signal state load failed:', error);
-    }
-  }
-
-  private syncTradesWithSignals(): void {
-    const ordered = [...this.signals.values()].sort(
-      (a, b) => (a.resolvedAt ?? a.signalTime) - (b.resolvedAt ?? b.signalTime)
-    );
-    for (const signal of ordered) {
-      const trade = this.trades.get(signal.id);
-      if (!trade) {
-        this.openDummyTrade(signal);
-        if (signal.status === 'OPEN') continue;
-        const opened = this.trades.get(signal.id);
-        if (!opened) continue;
-        const exit = signal.resolutionPrice ?? signal.entry;
-        const at = signal.resolvedAt ?? signal.signalTime;
-        const pnl = tradePnl(
-          opened.symbol,
-          opened.direction,
-          opened.lotSize,
-          opened.entryPrice,
-          exit,
-          this.quoteRates()
-        );
-        this.balance = roundMoney(this.balance + pnl);
-        opened.status = 'CLOSED';
-        opened.outcome = signal.status;
-        opened.closedAt = at;
-        opened.closedAtUtc = isoUtc(at);
-        opened.exitPrice = exit;
-        opened.pnl = pnl;
-        opened.unrealizedPnl = 0;
-        opened.balanceAfter = this.balance;
-        continue;
-      }
-      if (trade.status === 'OPEN' && signal.status !== 'OPEN') {
-        this.closeDummyTrade(
-          signal,
-          signal.status,
-          signal.resolutionPrice ?? signal.entry,
-          signal.resolvedAt ?? signal.signalTime
-        );
-      } else if (trade.status === 'CLOSED' && signal.status !== 'OPEN') {
-        trade.outcome = signal.status;
-      }
-    }
-    this.trimTradeHistory();
-  }
-
-  private normalizeStoredTrade(item: unknown): DummyTrade | null {
-    if (!item || typeof item !== 'object') return null;
-    const raw = item as Record<string, unknown>;
-    const symbol = String(raw.symbol ?? '').toUpperCase();
-    if (!toInstrument(symbol)) return null;
-    const id = String(raw.id ?? raw.signalId ?? '');
-    const openedAt = Number(raw.openedAt);
-    const entryPrice = Number(raw.entryPrice);
-    if (!id || !Number.isFinite(openedAt) || !Number.isFinite(entryPrice)) return null;
-    const status = raw.status === 'CLOSED' ? 'CLOSED' : 'OPEN';
-    const direction = raw.direction === 'SHORT' ? 'SHORT' : 'LONG';
-    const lotSize = Number(raw.lotSize);
-    const closedAt = raw.closedAt === null || raw.closedAt === undefined ? null : Number(raw.closedAt);
-    return {
-      id,
-      signalId: String(raw.signalId ?? id),
-      symbol,
-      direction,
-      lotSize: Number.isFinite(lotSize) && lotSize > 0 ? lotSize : MIN_LOT_SIZE,
-      entryPrice,
-      stopLoss: Number(raw.stopLoss ?? 0),
-      takeProfit: Number(raw.takeProfit ?? 0),
-      openedAt,
-      openedAtUtc: String(raw.openedAtUtc ?? isoUtc(openedAt)),
-      closedAt: Number.isFinite(closedAt as number) ? (closedAt as number) : null,
-      closedAtUtc: raw.closedAtUtc ? String(raw.closedAtUtc) : null,
-      exitPrice:
-        raw.exitPrice === null || raw.exitPrice === undefined ? null : Number(raw.exitPrice),
-      status,
-      outcome: (raw.outcome as SignalStatus | null) ?? null,
-      pnl: Number(raw.pnl ?? 0),
-      unrealizedPnl: Number(raw.unrealizedPnl ?? 0),
-      balanceAfter:
-        raw.balanceAfter === null || raw.balanceAfter === undefined
-          ? null
-          : Number(raw.balanceAfter),
-    };
-  }
-
-  private normalizeStoredWithdrawal(item: unknown): Withdrawal | null {
-    if (!item || typeof item !== 'object') return null;
-    const raw = item as Record<string, unknown>;
-    const method = raw.method === 'JAZZCASH' || raw.method === 'EASYPAISA' ? raw.method : null;
-    const id = String(raw.id ?? '');
-    const requestedAt = Number(raw.requestedAt);
-    const amount = Number(raw.amount);
-    if (!method || !id || !Number.isFinite(requestedAt) || !Number.isFinite(amount)) return null;
-    return {
-      id,
-      method,
-      accountNumber: String(raw.accountNumber ?? ''),
-      accountTitle: String(raw.accountTitle ?? ''),
-      amount,
-      status: 'PAID',
-      reference: String(raw.reference ?? ''),
-      requestedAt,
-      requestedAtUtc: String(raw.requestedAtUtc ?? isoUtc(requestedAt)),
-      balanceAfter: Number(raw.balanceAfter ?? 0),
-    };
-  }
-
-  private normalizeStoredSignal(item: unknown): TrackedSignal | null {
-    if (!item || typeof item !== 'object') return null;
-    const raw = item as Record<string, unknown>;
-    const required = ['id', 'symbol', 'direction', 'entry', 'stopLoss', 'takeProfit', 'signalTime'];
-    for (const key of required) {
-      if (raw[key] === undefined || raw[key] === null) return null;
-    }
-    const signalTime = Number(raw.signalTime);
-    if (!Number.isFinite(signalTime)) return null;
-    const signalMinuteEnd = Math.floor(signalTime / 60_000) * 60_000 + 60_000;
-    const status = (raw.status as SignalStatus) ?? 'OPEN';
-    const direction = raw.direction === 'SHORT' ? 'SHORT' : 'LONG';
-    const tracked: TrackedSignal = {
-      id: String(raw.id),
-      symbol: String(raw.symbol),
-      direction,
-      status,
-      verdict: String(raw.verdict ?? verdictFor(status)),
-      timeframe: raw.timeframe === 'M30' ? 'M30' : 'H1',
-      bodyTop: Number(raw.bodyTop ?? 0),
-      bodyBottom: Number(raw.bodyBottom ?? 0),
-      htfVolRatio: Number(raw.htfVolRatio ?? 0),
-      m1VolRatio: Number(raw.m1VolRatio ?? 0),
-      entry: Number(raw.entry),
-      stopLoss: Number(raw.stopLoss),
-      takeProfit: Number(raw.takeProfit),
-      riskPct: Number(raw.riskPct ?? 0),
-      rewardPct: Number(raw.rewardPct ?? 0),
-      roePct: Number(raw.roePct ?? 0),
-      leverage: Number(raw.leverage ?? this.opts.leverage),
-      signalTime,
-      signalTimeUtc: String(raw.signalTimeUtc ?? isoUtc(signalTime)),
-      resolvedAt: raw.resolvedAt === null || raw.resolvedAt === undefined ? null : Number(raw.resolvedAt),
-      resolvedAtUtc: raw.resolvedAtUtc ? String(raw.resolvedAtUtc) : null,
-      resolutionPrice:
-        raw.resolutionPrice === null || raw.resolutionPrice === undefined
-          ? null
-          : Number(raw.resolutionPrice),
-      holdMinutes:
-        raw.holdMinutes === null || raw.holdMinutes === undefined ? null : Number(raw.holdMinutes),
-      mfeR: Number(raw.mfeR ?? 0),
-      maeR: Number(raw.maeR ?? 0),
-      livePrice: raw.livePrice === null || raw.livePrice === undefined ? null : Number(raw.livePrice),
-      liveUpdatedAt:
-        raw.liveUpdatedAt === null || raw.liveUpdatedAt === undefined
-          ? null
-          : Number(raw.liveUpdatedAt),
-      priceChangePct: Number(raw.priceChangePct ?? 0),
-      unrealizedR: Number(raw.unrealizedR ?? 0),
-      progressPct: Number(raw.progressPct ?? 0),
-      distanceToTpPct: Number(raw.distanceToTpPct ?? 0),
-      distanceToSlPct: Number(raw.distanceToSlPct ?? 0),
-      reason: String(raw.reason ?? ''),
-      triggerCandleOpen: Number(raw.triggerCandleOpen ?? Math.floor(signalTime / 60_000) * 60_000),
-      signalMinuteEnd,
-      nextCandleOpen: Number(raw.nextCandleOpen ?? signalMinuteEnd),
-      intraDone: raw.intraDone === undefined ? Date.now() >= signalMinuteEnd : Boolean(raw.intraDone),
-      initialRiskDistance:
-        Number.isFinite(Number(raw.initialRiskDistance)) && Number(raw.initialRiskDistance) > 0
-          ? Number(raw.initialRiskDistance)
-          : Math.abs(Number(raw.entry) - Number(raw.stopLoss)),
-      bestPrice:
-        Number.isFinite(Number(raw.bestPrice)) && Number(raw.bestPrice) > 0
-          ? direction === 'LONG'
-            ? Math.max(Number(raw.entry), Number(raw.bestPrice))
-            : Math.min(Number(raw.entry), Number(raw.bestPrice))
-          : Number(raw.entry),
-      breakevenActive: Boolean(raw.breakevenActive),
-    };
-    return tracked;
-  }
 }
 
-export function createSignalEngineFromEnv(): SignalEngine {
+export function createSignalEngineFromEnv(
+  mt5Broker: Mt5Broker | null = null,
+  persisted: DashboardState = {}
+): SignalEngine {
   const pairsOverride = (process.env.SIGNAL_PAIRS ?? '')
     .split(',')
     .map((value) => value.trim().toUpperCase())
@@ -1962,17 +2453,11 @@ export function createSignalEngineFromEnv(): SignalEngine {
       : 'https://api-fxpractice.oanda.com';
   const oandaApiKey = (process.env.OANDA_API_KEY ?? '').trim();
 
-  const stateFile = path.resolve(
-    process.cwd(),
-    process.env.SIGNAL_STATE_FILE ?? path.join('data', 'live_signals_state.json')
-  );
-
   return new SignalEngine({
     enabled: envFlag('SIGNAL_ENGINE_ENABLED', true),
     scanIntervalMs: envNumber('SIGNAL_SCAN_INTERVAL_MS', 25_000),
     watchIntervalMs: envNumber('SIGNAL_WATCH_INTERVAL_MS', 5_000),
     maxTrackHours: envNumber('SIGNAL_MAX_TRACK_HOURS', 24),
-    stateFile,
     scanConcurrency: Math.round(envNumber('SIGNAL_SCAN_CONCURRENCY', 10)),
     watchConcurrency: Math.round(envNumber('SIGNAL_WATCH_CONCURRENCY', 6)),
     priceIntervalMs: envNumber('SIGNAL_PRICE_INTERVAL_MS', 500),
@@ -1980,7 +2465,10 @@ export function createSignalEngineFromEnv(): SignalEngine {
     maxOpenPerSymbol: Math.max(1, Math.round(envNumber('SIGNAL_MAX_OPEN_PER_SYMBOL', 1))),
     reentryCooldownMs: envNumber('SIGNAL_REENTRY_COOLDOWN_MIN', 60) * 60_000,
     pairsOverride,
+    persistedPairs: persisted.activePairs,
+    persistedSuffix: persisted.mt5SymbolSuffix,
     oandaHost,
     oandaApiKey,
+    mt5Broker,
   });
 }

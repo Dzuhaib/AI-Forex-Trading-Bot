@@ -12,7 +12,6 @@ import {
   Wallet,
   Wifi,
   WifiOff,
-  XCircle,
   Zap,
 } from 'lucide-react';
 import type {
@@ -24,6 +23,8 @@ import type {
   SignalStatus,
 } from '../types';
 import { MiniTugOfWar } from './MiniTugOfWar';
+import { BearIcon, BullIcon } from './MarketBeasts';
+import { PairManager } from './PairManager';
 
 type SignalFilter = 'ALL' | 'OPEN' | 'TP' | 'SL' | 'BE' | 'OTHER';
 
@@ -57,9 +58,25 @@ function formatPct(value: number | null | undefined, digits = 2): string {
 }
 
 function formatMoney(value: number | null | undefined): string {
-  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  if (value === null || value === undefined || !Number.isFinite(value)) return '-';
   const sign = value < 0 ? '-' : '';
   return `${sign}$${Math.abs(value).toFixed(2)}`;
+}
+
+function formatAccountMoney(
+  value: number | null | undefined,
+  currency: string | undefined
+): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '-';
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency: currency || 'USD',
+      maximumFractionDigits: 2,
+    }).format(value);
+  } catch {
+    return `${value.toFixed(2)} ${currency ?? ''}`.trim();
+  }
 }
 
 function formatNotional(value: number | null | undefined): string {
@@ -159,9 +176,15 @@ function RangeBar({ signal }: { signal: LiveSignal }) {
     <div className="mt-3">
       <MiniTugOfWar signal={signal} />
       <div className="mt-2 flex items-center justify-between text-[10px] tabular-nums sm:text-[11px]">
-        <span className="text-[#d70015]">SL {formatPrice(signal.stopLoss)}</span>
+        <span className="inline-flex items-center gap-1 text-[#d70015]">
+          <BearIcon size={11} />
+          SL {formatPrice(signal.stopLoss)}
+        </span>
         <span className="text-[#86868b]">Entry {formatPrice(signal.entry)}</span>
-        <span className="text-[#1d8f3a]">TP {formatPrice(signal.takeProfit)}</span>
+        <span className="inline-flex items-center gap-1 text-[#1d8f3a]">
+          <BullIcon size={11} />
+          TP {formatPrice(signal.takeProfit)}
+        </span>
       </div>
     </div>
   );
@@ -340,13 +363,19 @@ function SignalHistoryCards({ signals, now }: { signals: LiveSignal[]; now: numb
                 </div>
               </div>
               <div>
-                <div className="text-[9px] uppercase tracking-[0.06em] text-[#86868b]">SL</div>
+                <div className="flex items-center gap-1 text-[9px] uppercase tracking-[0.06em] text-[#86868b]">
+                  <BearIcon size={10} />
+                  SL
+                </div>
                 <div className="mt-0.5 font-medium tabular-nums text-[#d70015]">
                   ${formatPrice(signal.stopLoss)}
                 </div>
               </div>
               <div>
-                <div className="text-[9px] uppercase tracking-[0.06em] text-[#86868b]">TP</div>
+                <div className="flex items-center gap-1 text-[9px] uppercase tracking-[0.06em] text-[#86868b]">
+                  <BullIcon size={10} />
+                  TP
+                </div>
                 <div className="mt-0.5 font-medium tabular-nums text-[#1d8f3a]">
                   ${formatPrice(signal.takeProfit)}
                 </div>
@@ -573,6 +602,8 @@ export const LiveSignalsViewer: React.FC = () => {
 
       {status && <StatusPanel status={status} now={now} />}
 
+      <PairManager onChanged={load} connected={Boolean(data?.mt5?.connected)} />
+
       {data?.account && (
         <section>
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -583,6 +614,11 @@ export const LiveSignalsViewer: React.FC = () => {
               <span className="text-[11px] text-[#86868b]">
                 {data.account.riskPercent}% risk · per-pair SL
               </span>
+              {data.mt5?.connected && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-[#e7f8eb] px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.06em] text-[#1d8f3a]">
+                  MT5 demo
+                </span>
+              )}
             </div>
             <span className="text-[11px] text-[#86868b]">
               {data.account.openTrades} open · {data.account.closedTrades} closed
@@ -591,23 +627,23 @@ export const LiveSignalsViewer: React.FC = () => {
           <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4 sm:gap-3">
             <StatCard
               label="Balance"
-              value={formatMoney(data.account.balance)}
+              value={formatAccountMoney(data.account.balance, data.account.currency)}
               icon={<Wallet className="h-4 w-4" strokeWidth={1.7} />}
             />
             <StatCard
               label="Equity"
-              value={formatMoney(data.account.equity)}
+              value={formatAccountMoney(data.account.equity, data.account.currency)}
               icon={<Activity className="h-4 w-4" strokeWidth={1.7} />}
             />
             <StatCard
               label="Open P&L"
-              value={formatMoney(data.account.unrealizedPnl)}
+              value={formatAccountMoney(data.account.unrealizedPnl, data.account.currency)}
               accent={data.account.unrealizedPnl >= 0 ? 'text-[#1d8f3a]' : 'text-[#d70015]'}
               icon={<TrendingUp className="h-4 w-4" strokeWidth={1.7} />}
             />
             <StatCard
               label="Realized P&L"
-              value={formatMoney(data.account.realizedPnl)}
+              value={formatAccountMoney(data.account.realizedPnl, data.account.currency)}
               accent={data.account.realizedPnl >= 0 ? 'text-[#1d8f3a]' : 'text-[#d70015]'}
               icon={<CheckCircle2 className="h-4 w-4" strokeWidth={1.7} />}
             />
@@ -625,7 +661,7 @@ export const LiveSignalsViewer: React.FC = () => {
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 sm:gap-3 lg:grid-cols-7">
+      <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 sm:gap-3 lg:grid-cols-6">
         <StatCard
           label="Open"
           value={loading ? '—' : engineTotals.open}
@@ -635,24 +671,19 @@ export const LiveSignalsViewer: React.FC = () => {
           label="TP"
           value={loading ? '—' : engineTotals.tp}
           accent={engineTotals.tp > 0 ? 'text-[#1d8f3a]' : undefined}
-          icon={<CheckCircle2 className="h-4 w-4" strokeWidth={1.7} />}
+          icon={<BullIcon size={16} />}
         />
         <StatCard
           label="SL"
           value={loading ? '—' : engineTotals.sl}
           accent={engineTotals.sl > 0 ? 'text-[#d70015]' : undefined}
-          icon={<XCircle className="h-4 w-4" strokeWidth={1.7} />}
+          icon={<BearIcon size={16} />}
         />
         <StatCard
           label="Breakeven"
           value={loading ? '—' : engineTotals.breakeven}
           accent={engineTotals.breakeven > 0 ? 'text-[#6e56cf]' : undefined}
           icon={<MinusCircle className="h-4 w-4" strokeWidth={1.7} />}
-        />
-        <StatCard
-          label="Win rate"
-          value={loading ? '—' : `${status?.winRatePct?.toFixed(1) ?? '0.0'}%`}
-          icon={<TrendingUp className="h-4 w-4" strokeWidth={1.7} />}
         />
         <StatCard
           label="Ambiguous"
@@ -779,12 +810,14 @@ export const LiveSignalsViewer: React.FC = () => {
               <button
                 key={value}
                 onClick={() => setFilter(value)}
-                className={`shrink-0 rounded-full px-3 py-1 text-[11px] ${
+                className={`inline-flex shrink-0 items-center gap-1 rounded-full px-3 py-1 text-[11px] ${
                   filter === value
                     ? 'bg-white font-semibold text-[#1d1d1f]'
                     : 'font-medium text-[#6e6e73]'
                 }`}
               >
+                {value === 'TP' && <BullIcon size={12} />}
+                {value === 'SL' && <BearIcon size={12} />}
                 {label}
               </button>
             ))}
@@ -804,8 +837,18 @@ export const LiveSignalsViewer: React.FC = () => {
                   <th className="px-4 py-3 font-medium">Side</th>
                   <th className="px-4 py-3 font-medium">Status</th>
                   <th className="px-4 py-3 text-right font-medium">Entry</th>
-                  <th className="px-4 py-3 text-right font-medium">SL</th>
-                  <th className="px-4 py-3 text-right font-medium">TP</th>
+                  <th className="px-4 py-3 text-right font-medium">
+                    <span className="inline-flex items-center gap-1">
+                      <BearIcon size={12} />
+                      SL
+                    </span>
+                  </th>
+                  <th className="px-4 py-3 text-right font-medium">
+                    <span className="inline-flex items-center gap-1">
+                      <BullIcon size={12} />
+                      TP
+                    </span>
+                  </th>
                   <th className="px-4 py-3 text-right font-medium">Live / exit</th>
                   <th className="px-4 py-3 text-right font-medium">R</th>
                   <th className="px-4 py-3 text-right font-medium">MFE / MAE</th>
