@@ -14,6 +14,7 @@ type BeastIconProps = {
   animated?: boolean;
   className?: string;
   title?: string;
+  flip?: boolean;
 };
 
 export function BeastGlyph({
@@ -371,6 +372,7 @@ function BeastIcon({
   animated = false,
   className,
   title,
+  flip = false,
 }: BeastIconProps & { kind: BeastKind }) {
   const labelled = Boolean(title);
   return (
@@ -385,7 +387,7 @@ function BeastIcon({
       focusable="false"
     >
       {title && <title>{title}</title>}
-      <BeastGlyph kind={kind} animated={animated} />
+      <BeastGlyph kind={kind} animated={animated} flip={flip} />
     </svg>
   );
 }

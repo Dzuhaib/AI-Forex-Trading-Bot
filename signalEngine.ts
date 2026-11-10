@@ -110,6 +110,7 @@ interface EngineOptions {
   pairsOverride: string[];
   persistedPairs?: string[];
   persistedSuffix?: string;
+  persistedRiskPercent?: number;
   oandaHost: string;
   oandaApiKey: string;
   mt5Broker: Mt5Broker | null;
@@ -271,9 +272,11 @@ const PAIR_CATEGORIES: Record<string, string> = {
 // Broker-style names that resolve to a canonical catalog symbol.
 const CANONICAL_ALIASES: Record<string, string> = {
   US30USD: 'US30',
+  DOW: 'US30',
   DOW30: 'US30',
   DJ30: 'US30',
   WS30: 'US30',
+  SPX: 'US500',
   SPX500: 'US500',
   SP500: 'US500',
   US500USD: 'US500',
@@ -309,6 +312,8 @@ const CANONICAL_ALIASES: Record<string, string> = {
   PALLADIUM: 'XPDUSD',
   COPPER: 'XCUUSD',
   USOIL: 'WTI',
+  USOUSD: 'WTI',
+  CLOIL: 'WTI',
   WTIUSD: 'WTI',
   XTIUSD: 'WTI',
   CRUDOIL: 'WTI',
@@ -461,7 +466,7 @@ const GRANULARITY_MS: Record<Interval, number> = {
 function normalizeSymbolBody(value: string): string {
   return String(value ?? '')
     .replace(/\.[^.]+$/, '')
-    .replace(/[_\s-]/g, '')
+    .replace(/[_\s+-]/g, '')
     .toUpperCase();
 }
 
@@ -482,7 +487,8 @@ function baseSymbol(symbol: string): string {
       }
     }
   }
-  return normalizeSymbolBody(value);
+  const normalized = normalizeSymbolBody(value);
+  return CANONICAL_ALIASES[normalized] ?? normalized;
 }
 
 function normalizePairSymbol(value: unknown): string {
@@ -497,7 +503,8 @@ function savedPairKey(value: unknown): string {
 }
 
 function toInstrument(symbol: string): string | null {
-  return SYMBOL_INSTRUMENTS[baseSymbol(symbol)] ?? null;
+  const base = baseSymbol(symbol);
+  return SYMBOL_INSTRUMENTS[base] ?? resolveInstrument(base);
 }
 
 function resolveCanonical(base: string): string {
@@ -562,7 +569,10 @@ const MIN_LOT_SIZE = 0.01;
 const MAX_LOT_SIZE = 100;
 const LOT_STEP = 0.01;
 const RISK_PERCENT = 5;
+const MIN_RISK_PERCENT = 0.1;
+const MAX_RISK_PERCENT = 100;
 const REWARD_RISK_RATIO = 2;
+const MIN_STOP_DISTANCE: Record<string, number> = {};
 const STOP_LOSS_DISTANCE: Record<string, number> = {
   XAUUSD: 4,
   WTI: 0.4,
@@ -615,9 +625,16 @@ const STOP_LOSS_DISTANCE: Record<string, number> = {
   UK10YB: 0.3,
   DE10YB: 0.3,
 };
-const BREAKEVEN_TRIGGER_PCT = 50;
-const BREAKEVEN_LOCK_PCT = 20;
+const BREAKEVEN_TRIGGER_PCT = 70;
+const BREAKEVEN_LOCK_PCT = 0;
 const TRAILING_GAP_PCT = 30;
+
+function clampRiskPercent(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return RISK_PERCENT;
+  return Math.min(MAX_RISK_PERCENT, Math.max(MIN_RISK_PERCENT, Math.round(parsed * 100) / 100));
+}
+
 const EMPTY_MT5_STATUS: Mt5Status = {
   state: 'DISCONNECTED',
   connected: false,
@@ -1088,6 +1105,7 @@ export class SignalEngine {
     expired: 0,
   };
   private executions = new Map<string, SignalExecution>();
+  private signalIdByTicket = new Map<number, string>();
   private activePairs: string[] = [];
   private symbols: string[] = [];
   private symbolSource = 'default-static';
@@ -1118,11 +1136,16 @@ export class SignalEngine {
   private mt5SymbolsLoadedAt = 0;
   private mt5SymbolsLoading: Promise<void> | null = null;
   private mt5SuffixHint = '';
+  private mt5AccountLogin: number | null = null;
+  private mt5BrokerSymbols = new Map<string, string>();
+  private mt5BrokerSymbolScores = new Map<string, number>();
   private persistedSuffix: string;
+  private riskPercent: number;
 
   constructor(options: EngineOptions) {
     this.opts = options;
     this.persistedSuffix = normalizeSymbolSuffix(options.persistedSuffix ?? '');
+    this.riskPercent = clampRiskPercent(options.persistedRiskPercent ?? RISK_PERCENT);
     const requested =
       options.persistedPairs !== undefined
         ? options.persistedPairs
@@ -1168,6 +1191,7 @@ export class SignalEngine {
   resetJournal(): void {
     this.signals.clear();
     this.executions.clear();
+    this.signalIdByTicket.clear();
     this.lastExecutionError = null;
     this.lastTriggerBySymbol.clear();
     this.stats = {
@@ -1183,6 +1207,16 @@ export class SignalEngine {
 
   private riskBase(): number {
     return this.opts.mt5Broker?.getBalance() ?? DEFAULT_RISK_BALANCE;
+  }
+
+  getRiskPercent(): number {
+    return this.riskPercent;
+  }
+
+  setRiskPercent(value: unknown): number {
+    this.riskPercent = clampRiskPercent(value);
+    this.applyRiskTargets();
+    return this.riskPercent;
   }
 
   private symbolSuffix(): string {
@@ -1255,9 +1289,12 @@ export class SignalEngine {
     | null {
     const base = baseSymbol(symbol);
     const pip = PIP_SIZE[base];
-    const slDistance = STOP_LOSS_DISTANCE[base];
+    const slDistance = Math.max(
+      STOP_LOSS_DISTANCE[base] ?? 0,
+      MIN_STOP_DISTANCE[base] ?? 0
+    );
     if (!(pip > 0) || !(slDistance > 0)) return null;
-    const riskUsd = roundMoney(balance * (RISK_PERCENT / 100));
+    const riskUsd = roundMoney(balance * (this.riskPercent / 100));
     if (!(riskUsd > 0)) return null;
     const pipValue = pipValueUsd(symbol, this.quoteRates());
     if (!(pipValue > 0)) return null;
@@ -1336,6 +1373,27 @@ export class SignalEngine {
     }
 
     const mt5Snapshot = this.opts.mt5Broker?.getAccountSnapshot();
+    const account = mt5Snapshot
+      ? { ...mt5Snapshot.account, riskPercent: this.riskPercent }
+      : null;
+    const trades = mt5Snapshot?.trades ?? [];
+    for (const trade of trades) {
+      if (trade.status !== 'CLOSED' || trade.mt5Ticket === null) continue;
+      const signalId = this.signalIdByTicket.get(trade.mt5Ticket);
+      if (!signalId) continue;
+      const signal = this.signals.get(signalId);
+      if (!signal) continue;
+      const offset = trade.entryPrice - signal.entry;
+      if (
+        signal.status === 'TP_HIT' ||
+        signal.status === 'SL_HIT' ||
+        signal.status === 'BREAKEVEN_HIT'
+      ) {
+        trade.outcome = signal.status;
+      }
+      if (!trade.stopLoss) trade.stopLoss = signal.stopLoss + offset;
+      if (!trade.takeProfit) trade.takeProfit = signal.takeProfit + offset;
+    }
 
     return {
       generatedAt: now,
@@ -1343,8 +1401,9 @@ export class SignalEngine {
       signals: publicSignals,
       nearZones: this.nearZones,
       market,
-      account: mt5Snapshot?.account ?? null,
-      trades: mt5Snapshot?.trades ?? [],
+      account,
+      riskPercent: this.riskPercent,
+      trades,
       mt5: this.opts.mt5Broker?.getStatus() ?? EMPTY_MT5_STATUS,
     };
   }
@@ -1491,7 +1550,11 @@ export class SignalEngine {
 
     const broker = this.opts.mt5Broker;
     if (!broker?.isConnected()) return;
+    const login = broker.getStatus().account?.login ?? null;
+    const accountChanged =
+      login !== null && this.mt5AccountLogin !== null && login !== this.mt5AccountLogin;
     const mt5Fresh =
+      !accountChanged &&
       this.mt5SymbolsLoadedAt > 0 &&
       Date.now() - this.mt5SymbolsLoadedAt < 10 * 60 * 1000;
     if (!force && mt5Fresh) return;
@@ -1513,7 +1576,25 @@ export class SignalEngine {
       return;
     }
     if (symbols.length === 0) return;
-    this.mt5SuffixHint = inferMt5Suffix(symbols);
+    const login = broker.getStatus().account?.login ?? null;
+    const accountChanged =
+      login !== null && this.mt5AccountLogin !== null && login !== this.mt5AccountLogin;
+    const detectedSuffix = inferMt5Suffix(symbols);
+    this.mt5SuffixHint = detectedSuffix;
+
+    const currentSuffix = this.symbolSuffix();
+    const suffixMatches = currentSuffix
+      ? symbols.filter((row) => row.name.toLowerCase().endsWith(currentSuffix.toLowerCase()))
+          .length / symbols.length
+      : 0;
+    if (accountChanged || (currentSuffix && suffixMatches < 0.7)) {
+      this.persistedSuffix = detectedSuffix;
+      broker.setSymbolSuffix(detectedSuffix);
+    }
+    this.mt5AccountLogin = login;
+
+    this.mt5BrokerSymbols.clear();
+    this.mt5BrokerSymbolScores.clear();
     for (const row of symbols) this.registerMt5Symbol(row);
     this.mt5SymbolsLoadedAt = Date.now();
     this.refreshSymbols();
@@ -1538,6 +1619,8 @@ export class SignalEngine {
         instrument = resolveInstrument(canonical);
       }
     }
+
+    this.rememberMt5BrokerSymbol(key, row);
 
     if (PAIR_SET.has(key)) {
       addPairAlias(key, rawName);
@@ -1577,6 +1660,27 @@ export class SignalEngine {
     } else if (/X10$/i.test(key)) {
       addPairAlias(key, key.replace(/X10$/i, '10'));
     }
+  }
+
+  private rememberMt5BrokerSymbol(key: string, row: Mt5SymbolInfo): void {
+    const minStop = Number(row.stopsLevel) * Number(row.point);
+    if (Number.isFinite(minStop) && minStop > 0) {
+      MIN_STOP_DISTANCE[key] = Math.max(MIN_STOP_DISTANCE[key] ?? 0, minStop);
+    }
+    const hasQuote = row.bid > 0 && row.ask > 0;
+    const tradeScore = row.tradeMode === 4 ? 2 : row.tradeMode > 0 ? 1 : 0;
+    const hint = this.mt5SuffixHint.toLowerCase();
+    const suffixMatch = hint.length > 0 && row.name.toLowerCase().endsWith(hint);
+    const score =
+      tradeScore * 100 +
+      (hasQuote ? 10 : 0) +
+      (suffixMatch ? 5 : 0) +
+      (row.time > 0 ? 1 : 0) +
+      (row.name.endsWith('+') ? -1 : 1);
+    const existing = this.mt5BrokerSymbolScores.get(key);
+    if (existing !== undefined && existing >= score) return;
+    this.mt5BrokerSymbols.set(key, row.name);
+    this.mt5BrokerSymbolScores.set(key, score);
   }
 
   private async loadOandaInstruments(): Promise<void> {
@@ -1652,7 +1756,16 @@ export class SignalEngine {
   refreshSymbols(): void {
     const suffix = this.symbolSuffix();
     setActiveSymbolSuffix(suffix);
-    this.symbols = this.activePairs.map((base) => symbolWithSuffix(base, suffix));
+    const symbols: string[] = [];
+    for (const base of this.activePairs) {
+      const root = base.replace(/(X10|X100)$/i, '');
+      const symbol =
+        this.mt5BrokerSymbols.get(base) ??
+        (root !== base ? this.mt5BrokerSymbols.get(root) : undefined) ??
+        symbolWithSuffix(base, suffix);
+      if (!symbols.includes(symbol)) symbols.push(symbol);
+    }
+    this.symbols = symbols;
     this.symbolSource = 'OANDA';
     this.lastSymbolRefreshAt = Date.now();
   }
@@ -1704,9 +1817,10 @@ export class SignalEngine {
   private async scanOnce(): Promise<void> {
     if (this.scanning || !this.running) return;
     this.scanning = true;
-    this.flushPendingExecutions();
     const started = Date.now();
     try {
+      await this.ensurePairsLoaded();
+      this.flushPendingExecutions();
       if (this.symbols.length === 0 && this.activePairs.length > 0) {
         this.refreshSymbols();
       }
@@ -1982,6 +2096,11 @@ export class SignalEngine {
   private requestExecutionClose(signal: TrackedSignal): void {
     const execution = this.executions.get(signal.id);
     if (!execution) return;
+    if (signal.status === 'EXPIRED' && signal.breakevenActive) {
+      // Breakeven-protected trades keep running on the broker's stop and take
+      // profit at the tracking deadline instead of being cut off early.
+      return;
+    }
     execution.closeRequested = true;
     this.tryCloseExecution(execution);
   }
@@ -2022,15 +2141,20 @@ export class SignalEngine {
         throw new Error('MT5 quote unavailable for the broker symbol.');
       }
       execution.offset = quote.price - signal.entry;
+      const slDistance = Math.abs(signal.entry - signal.stopLoss);
+      const tpDistance = Math.abs(signal.takeProfit - signal.entry);
       const result = await broker.placeOrder({
         symbol: signal.symbol,
         direction: signal.direction,
         volume: execution.volume,
         sl: signal.stopLoss + execution.offset,
         tp: signal.takeProfit + execution.offset,
+        slDistance,
+        tpDistance,
       });
       execution.ticket = result.ticket;
       execution.error = null;
+      this.signalIdByTicket.set(result.ticket, signal.id);
       this.lastExecutionError = null;
       this.lastError = null;
       if (execution.closeRequested) this.tryCloseExecution(execution);
@@ -2282,7 +2406,7 @@ export class SignalEngine {
         : Math.min(signal.bestPrice, favourablePrice);
 
     const progress = Math.abs(signal.bestPrice - signal.entry);
-    if (progress < tpDistance * (BREAKEVEN_TRIGGER_PCT / 100)) {
+    if (!signal.breakevenActive && progress < tpDistance * (BREAKEVEN_TRIGGER_PCT / 100)) {
       return;
     }
 
@@ -2457,7 +2581,7 @@ export function createSignalEngineFromEnv(
     enabled: envFlag('SIGNAL_ENGINE_ENABLED', true),
     scanIntervalMs: envNumber('SIGNAL_SCAN_INTERVAL_MS', 25_000),
     watchIntervalMs: envNumber('SIGNAL_WATCH_INTERVAL_MS', 5_000),
-    maxTrackHours: envNumber('SIGNAL_MAX_TRACK_HOURS', 24),
+    maxTrackHours: envNumber('SIGNAL_MAX_TRACK_HOURS', 72),
     scanConcurrency: Math.round(envNumber('SIGNAL_SCAN_CONCURRENCY', 10)),
     watchConcurrency: Math.round(envNumber('SIGNAL_WATCH_CONCURRENCY', 6)),
     priceIntervalMs: envNumber('SIGNAL_PRICE_INTERVAL_MS', 500),
@@ -2467,6 +2591,7 @@ export function createSignalEngineFromEnv(
     pairsOverride,
     persistedPairs: persisted.activePairs,
     persistedSuffix: persisted.mt5SymbolSuffix,
+    persistedRiskPercent: persisted.riskPercent,
     oandaHost,
     oandaApiKey,
     mt5Broker,

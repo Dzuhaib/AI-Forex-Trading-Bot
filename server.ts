@@ -4,7 +4,8 @@ import path from 'path';
 import dotenv from 'dotenv';
 import { createSignalEngineFromEnv } from './signalEngine';
 import { Mt5Broker } from './mt5Broker';
-import { loadDashboardState, saveDashboardState } from './dashboardState';
+import { loadDashboardState, saveDashboardState, saveMt5Account } from './dashboardState';
+import { listAccountHistoryLogins } from './mt5HistoryStore';
 import {
   getGeminiApiKey,
   normalizeAnnouncementText,
@@ -61,7 +62,21 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 5000;
   const mt5Broker = new Mt5Broker();
   const persisted = loadDashboardState();
+  const mt5Credentials = new Map<
+    number,
+    { password: string; server: string; terminalPath: string }
+  >();
   const signalEngine = createSignalEngineFromEnv(mt5Broker, persisted);
+
+  const rememberMT5Credentials = (
+    login: number,
+    password: string,
+    server: string,
+    terminalPath: string
+  ): void => {
+    if (!Number.isInteger(login) || login <= 0 || !password) return;
+    mt5Credentials.set(login, { password, server, terminalPath });
+  };
 
   const applyDetectedSuffix = async (): Promise<string | null> => {
     const detected = await signalEngine.detectAndApplySymbolSuffix();
@@ -150,11 +165,92 @@ async function startServer() {
     res.json(mt5Broker.getStatus());
   });
 
+  app.get('/api/mt5/accounts', (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const state = loadDashboardState();
+    res.json({
+      accounts: state.mt5Accounts ?? [],
+      passwordKnown: [...mt5Credentials.keys()],
+      historyAccounts: listAccountHistoryLogins(),
+    });
+  });
+
+  app.post('/api/mt5/switch', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const login = Number(body.login);
+      if (!Number.isInteger(login) || login <= 0) {
+        res.status(400).json({ error: 'Enter a valid account number.' });
+        return;
+      }
+      const state = loadDashboardState();
+      const saved = (state.mt5Accounts ?? []).find((account) => account.login === login);
+      const provided = String(body.password ?? '');
+      const remembered = mt5Credentials.get(login);
+      const password = provided || remembered?.password || '';
+      if (!password) {
+        res.status(400).json({ error: 'Enter the MT5 password to switch accounts.' });
+        return;
+      }
+      const serverValue = String(body.server ?? '').trim() || remembered?.server || saved?.server || '';
+      const terminalPath =
+        String(body.terminalPath ?? '').trim() || remembered?.terminalPath || '';
+      const result = await mt5Broker.connect({
+        login,
+        password,
+        server: serverValue,
+        terminalPath,
+        symbolSuffix: '',
+      });
+      if (result.ok) {
+        rememberMT5Credentials(
+          login,
+          password,
+          String(result.status.config?.server ?? serverValue),
+          terminalPath
+        );
+        if (result.status.account) {
+          const account = result.status.account;
+          saveMt5Account({
+            login,
+            server: String(account.server ?? serverValue),
+            name: String(account.name ?? ''),
+            company: String(account.company ?? ''),
+            currency: String(account.currency ?? ''),
+          });
+        }
+        signalEngine.resetJournal();
+        await applyDetectedSuffix();
+        await signalEngine.ensurePairsLoaded(true);
+      }
+      res.status(result.ok ? 200 : 400).json(result);
+    } catch {
+      res.status(500).json({ error: 'Switching MT5 accounts failed unexpectedly.' });
+    }
+  });
+
   app.post('/api/mt5/connect', async (req, res) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
       const result = await mt5Broker.connect({ ...body, symbolSuffix: '' });
       if (result.ok) {
+        const account = result.status.account;
+        const login = Number(body.login);
+        rememberMT5Credentials(
+          login,
+          String(body.password ?? ''),
+          String(result.status.config?.server ?? ''),
+          String(body.terminalPath ?? '')
+        );
+        if (account) {
+          saveMt5Account({
+            login: account.login,
+            server: account.server,
+            name: account.name,
+            company: account.company,
+            currency: account.currency,
+          });
+        }
         signalEngine.resetJournal();
         await applyDetectedSuffix();
         await signalEngine.ensurePairsLoaded(true);
@@ -185,6 +281,21 @@ async function startServer() {
       res.status(result.ok ? 200 : 400).json(result);
     } catch {
       res.status(500).json({ error: 'Updating the symbol suffix failed unexpectedly.' });
+    }
+  });
+
+  app.post('/api/risk', (req, res) => {
+    try {
+      const raw = Number((req.body ?? {}).riskPercent);
+      if (!Number.isFinite(raw) || raw < 0.1 || raw > 100) {
+        res.status(400).json({ error: 'Risk percentage must be between 0.1 and 100.' });
+        return;
+      }
+      const riskPercent = signalEngine.setRiskPercent(raw);
+      saveDashboardState({ riskPercent });
+      res.json({ ok: true, riskPercent });
+    } catch {
+      res.status(500).json({ error: 'Updating the risk percentage failed unexpectedly.' });
     }
   });
 

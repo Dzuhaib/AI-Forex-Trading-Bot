@@ -84,7 +84,7 @@ Most signal dashboards stop at a marker on a chart. This project focuses on the 
 - **Stop loss:** fixed **per-instrument distance**.
 - **Take profit:** **2× the stop distance**.
 - **Risk-to-reward ratio:** exactly **1:2**.
-- **Breakeven trail:** at **50% of TP**, the stop moves to a **20% TP profit lock**, then trails **30% of TP** behind the best favorable price.
+- **Breakeven trail:** at **70% of TP**, the stop moves to **entry (breakeven, 1R)**, then trails **30% of TP** behind the best favorable price so it can only continue toward profit.
 - Position size is calculated from account risk, instrument pip size, contract units, and USD quote conversion.
 - Lots round to the **0.01 lot step**, with a **0.01 minimum**, so actual risk can vary slightly.
 - Open positions are re-targeted to the active risk model when the engine starts, while preserving any trailing-stop progress.
@@ -361,7 +361,7 @@ The engine is intentionally explicit about risk:
 - **Stop distance:** fixed per instrument.
 - **Take-profit distance:** 2× the stop distance.
 - **Risk-to-reward:** exactly 1:2.
-- **Breakeven trail:** once price reaches 50% of TP, SL moves to 20% of TP profit and then trails 30% of TP behind the best favorable price.
+- **Breakeven trail:** once price reaches 70% of TP, SL moves to entry (breakeven, 1R) and then trails 30% of TP behind the best favorable price.
 - **Position size:** calculated automatically and rounded to the nearest 0.01 lot, with a 0.01 minimum.
 - **Balance model:** balance and equity are read directly from MT5; equity includes floating PnL.
 

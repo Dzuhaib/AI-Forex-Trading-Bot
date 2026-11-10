@@ -175,14 +175,38 @@ export interface Mt5Status {
   lastError: string | null;
 }
 
+export interface DailyPnlEntry {
+  date: string;
+  pnl: number;
+  trades: number;
+  wins: number;
+}
+
 export interface AccountSummary {
   balance: number;
   equity: number;
   unrealizedPnl: number;
   realizedPnl: number;
+  realizedPnlToday: number;
+  realizedPnlWeek: number;
+  realizedPnlMonth: number;
+  closedTradesToday: number;
+  closedTradesWeek: number;
+  closedTradesMonth: number;
   openTrades: number;
   closedTrades: number;
   riskPercent: number;
+  currency: string;
+  dailyPnl: DailyPnlEntry[];
+  historyFull: boolean;
+  historySyncedAt: number | null;
+}
+
+export interface Mt5AccountMeta {
+  login: number;
+  server: string;
+  name: string;
+  company: string;
   currency: string;
 }
 
@@ -219,6 +243,7 @@ export interface SignalsResponse {
   nearZones: NearZone[];
   market: MarketTicker[];
   account: AccountSummary | null;
+  riskPercent: number;
   trades: Mt5Trade[];
   mt5: Mt5Status;
 }

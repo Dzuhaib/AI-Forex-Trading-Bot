@@ -152,13 +152,18 @@ def _positions_payload() -> list[dict]:
 
 
 def _history_payload(payload: dict) -> dict:
-    try:
-        days = int(payload.get("days") or 30)
-    except (TypeError, ValueError):
-        days = 30
-    days = max(1, min(days, 365))
+    days_raw = payload.get("days")
+    full_history = days_raw == "all" or bool(payload.get("all"))
     date_to = datetime.now() + timedelta(days=1)
-    date_from = date_to - timedelta(days=days + 1)
+    if full_history:
+        date_from = datetime(1970, 1, 2)
+    else:
+        try:
+            days = int(days_raw or 30)
+        except (TypeError, ValueError):
+            days = 30
+        days = max(1, min(days, 3650))
+        date_from = date_to - timedelta(days=days + 1)
     deals = mt5.history_deals_get(date_from, date_to)
     if deals is None:
         error = mt5.last_error()
@@ -172,6 +177,7 @@ def _history_payload(payload: dict) -> dict:
         symbol = str(getattr(deal, "symbol", "") or "")
         if position_id <= 0 or not symbol:
             continue
+        reason = getattr(deal, "reason", None)
         result.append(
             {
                 "positionId": position_id,
@@ -188,6 +194,7 @@ def _history_payload(payload: dict) -> dict:
                 "time": int(deal.time) * 1000,
                 "comment": str(getattr(deal, "comment", "") or ""),
                 "magic": int(getattr(deal, "magic", 0) or 0),
+                "reason": int(reason) if reason is not None else -1,
             }
         )
     return {"deals": result}
@@ -317,6 +324,16 @@ def _find_open_position(symbol: str, order_ticket: int) -> object | None:
     return max(matches, key=lambda item: int(item.time))
 
 
+def _normalize_price(symbol_info: object, value: float) -> float:
+    tick_size = float(getattr(symbol_info, "trade_tick_size", 0) or 0)
+    if tick_size <= 0:
+        tick_size = float(getattr(symbol_info, "point", 0) or 0)
+    digits = int(getattr(symbol_info, "digits", 0) or 0)
+    if tick_size > 0:
+        value = round(value / tick_size) * tick_size
+    return round(value, digits)
+
+
 def _place_order(payload: dict) -> dict:
     symbol_info = _find_symbol(str(payload.get("symbol") or ""), str(payload.get("suffix") or ""))
     symbol = str(symbol_info.name)
@@ -326,23 +343,64 @@ def _place_order(payload: dict) -> dict:
 
     sl = float(payload.get("sl") or 0)
     tp = float(payload.get("tp") or 0)
-    if not sl > 0 or not tp > 0:
-        raise ValueError("Both SL and TP are required for an MT5 order.")
+    sl_distance = float(payload.get("slDistance") or 0)
+    tp_distance = float(payload.get("tpDistance") or 0)
+
+    if int(payload.get("dedupe") or 0):
+        want_buy = direction == "BUY"
+        for position in mt5.positions_get(symbol=symbol) or []:
+            same_side = (
+                int(position.type) == mt5.POSITION_TYPE_BUY and want_buy
+            ) or (
+                int(position.type) == mt5.POSITION_TYPE_SELL and not want_buy
+            )
+            if same_side:
+                raise RuntimeError(
+                    f"Duplicate trade blocked: an open {direction} position already exists "
+                    f"on {symbol} (ticket {position.ticket})."
+                )
 
     volume = _volume_for_symbol(symbol_info, float(payload.get("volume") or 0))
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
+    tick = _tick_payload(symbol_info, retries=12)
+    if tick["bid"] <= 0 or tick["ask"] <= 0:
         raise RuntimeError(f"MT5 tick unavailable for {symbol}.")
 
     is_buy = direction == "BUY"
+    price = float(tick["ask"] if is_buy else tick["bid"])
+
+    point = float(getattr(symbol_info, "point", 0) or 0)
+    stops_points = int(getattr(symbol_info, "trade_stops_level", 0) or 0)
+    freeze_points = int(getattr(symbol_info, "trade_freeze_level", 0) or 0)
+    spread = float(tick["ask"]) - float(tick["bid"])
+    min_distance = max(stops_points, freeze_points) * point + max(spread, 0.0) + point
+
+    if sl_distance > 0 and tp_distance > 0:
+        # Re-derive stops from the live execution price so a quote/drift between
+        # signal generation and order placement can never produce invalid stops.
+        sl_distance = max(sl_distance, min_distance)
+        tp_distance = max(tp_distance, min_distance)
+        sl = price - sl_distance if is_buy else price + sl_distance
+        tp = price + tp_distance if is_buy else price - tp_distance
+    elif not sl > 0 or not tp > 0:
+        raise ValueError("Both SL and TP are required for an MT5 order.")
+    elif min_distance > 0:
+        # Backwards-compatible absolute levels: push them outside the broker's
+        # minimum stop distance when needed.
+        if is_buy:
+            sl = min(sl, price - min_distance)
+            tp = max(tp, price + min_distance)
+        else:
+            sl = max(sl, price + min_distance)
+            tp = min(tp, price - min_distance)
+
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
         "volume": volume,
         "type": mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL,
-        "price": float(tick.ask if is_buy else tick.bid),
-        "sl": round(sl, int(symbol_info.digits)),
-        "tp": round(tp, int(symbol_info.digits)),
+        "price": price,
+        "sl": _normalize_price(symbol_info, sl),
+        "tp": _normalize_price(symbol_info, tp),
         "deviation": int(payload.get("deviation") or 20),
         "magic": MAGIC,
         "comment": COMMENT,
@@ -385,8 +443,10 @@ def _close_position(payload: dict) -> dict:
         return {"closed": False, "ticket": ticket, "message": "Position is already closed."}
     position = positions[0]
     symbol_info = mt5.symbol_info(position.symbol)
-    tick = mt5.symbol_info_tick(position.symbol)
-    if symbol_info is None or tick is None:
+    if symbol_info is None:
+        raise RuntimeError(f"MT5 symbol unavailable for {position.symbol}.")
+    tick = _tick_payload(symbol_info, retries=12)
+    if tick["bid"] <= 0 or tick["ask"] <= 0:
         raise RuntimeError(f"MT5 quote unavailable for {position.symbol}.")
 
     is_buy = int(position.type) == mt5.POSITION_TYPE_BUY
@@ -396,7 +456,7 @@ def _close_position(payload: dict) -> dict:
         "volume": float(position.volume),
         "type": mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
         "position": ticket,
-        "price": float(tick.bid if is_buy else tick.ask),
+        "price": float(tick["bid"] if is_buy else tick["ask"]),
         "deviation": int(payload.get("deviation") or 20),
         "magic": MAGIC,
         "comment": COMMENT,
@@ -477,8 +537,17 @@ TIMEFRAME_SECONDS = {
 }
 
 
-def _tick_payload(symbol_info: object) -> dict:
-    tick = mt5.symbol_info_tick(symbol_info.name)
+def _tick_payload(symbol_info: object, retries: int = 0, delay: float = 0.25) -> dict:
+    name = str(symbol_info.name)
+    tick = None
+    for attempt in range(max(0, retries) + 1):
+        tick = mt5.symbol_info_tick(name)
+        if tick is not None and (tick.bid > 0 or tick.ask > 0 or tick.last > 0):
+            break
+        if attempt < retries:
+            if not symbol_info.visible:
+                mt5.symbol_select(name, True)
+            time.sleep(delay)
     bid = float(tick.bid) if tick else 0.0
     ask = float(tick.ask) if tick else 0.0
     last = float(tick.last) if tick else 0.0
@@ -507,6 +576,7 @@ def _symbols_payload(_payload: dict) -> dict:
                 "volumeMin": float(symbol_info.volume_min),
                 "volumeStep": float(symbol_info.volume_step),
                 "tradeMode": int(symbol_info.trade_mode),
+                "stopsLevel": int(getattr(symbol_info, "trade_stops_level", 0) or 0),
                 "bid": tick["bid"],
                 "ask": tick["ask"],
                 "last": tick["last"],
@@ -558,7 +628,7 @@ def _candles_payload(payload: dict) -> dict:
 
 def _quote_payload(payload: dict) -> dict:
     symbol_info = _find_symbol(str(payload.get("symbol") or ""), str(payload.get("suffix") or ""))
-    tick = _tick_payload(symbol_info)
+    tick = _tick_payload(symbol_info, retries=12)
     price = tick["mid"] or tick["last"] or tick["bid"] or tick["ask"]
     if not price:
         raise RuntimeError(f"MT5 quote unavailable for {symbol_info.name}.")

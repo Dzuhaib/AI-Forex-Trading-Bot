@@ -17,6 +17,7 @@ import {
 import type {
   LiveSignal,
   MarketTicker,
+  Mt5Trade,
   NearZone,
   SignalEngineStatus,
   SignalsResponse,
@@ -52,6 +53,15 @@ function formatSigned(value: number | null | undefined, digits = 2): string {
   return `${value > 0 ? '+' : ''}${value.toFixed(digits)}`;
 }
 
+function sameInstrument(a: string, b: string): boolean {
+  const normalize = (value: string): string =>
+    value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '').split('.')[0];
+  const first = normalize(a);
+  const second = normalize(b);
+  if (!first || !second) return false;
+  return first === second || first.startsWith(second) || second.startsWith(first);
+}
+
 function formatPct(value: number | null | undefined, digits = 2): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return '—';
   return `${value > 0 ? '+' : ''}${value.toFixed(digits)}%`;
@@ -77,6 +87,23 @@ function formatAccountMoney(
   } catch {
     return `${value.toFixed(2)} ${currency ?? ''}`.trim();
   }
+}
+
+function pnlTintStyle(value: number | null | undefined): React.CSSProperties {
+  if (value === null || value === undefined || !Number.isFinite(value) || value === 0) return {};
+  const positive = value > 0;
+  const magnitude = Math.min(1, Math.abs(value) / 60);
+  const alpha = 0.05 + magnitude * 0.22;
+  const accent = 0.25 + magnitude * 0.45;
+  const rgb = positive ? '52, 199, 89' : '255, 59, 48';
+  return {
+    backgroundImage: `linear-gradient(90deg, rgba(${rgb}, ${alpha}) 0%, rgba(${rgb}, ${
+      alpha * 0.2
+    }) 100%)`,
+    borderColor: `rgba(${rgb}, ${accent})`,
+    boxShadow: `inset 3px 0 0 rgba(${rgb}, ${accent})`,
+    transition: 'background-image 400ms ease, border-color 400ms ease, box-shadow 400ms ease',
+  };
 }
 
 function formatNotional(value: number | null | undefined): string {
@@ -146,14 +173,19 @@ function StatCard({
   value,
   accent,
   icon,
+  style,
 }: {
   label: string;
   value: React.ReactNode;
   accent?: string;
   icon?: React.ReactNode;
+  style?: React.CSSProperties;
 }) {
   return (
-    <div className="rounded-2xl border border-black/[0.06] bg-white p-4 sm:p-5">
+    <div
+      style={style}
+      className="rounded-2xl border border-black/[0.06] bg-white p-4 sm:p-5"
+    >
       <div className="flex items-center justify-between gap-2">
         <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-[#86868b] sm:text-[11px]">
           {label}
@@ -531,6 +563,25 @@ export const LiveSignalsViewer: React.FC = () => {
   const nearZones = data?.nearZones ?? [];
   const market = data?.market ?? [];
   const openSignals = useMemo(() => signals.filter((signal) => signal.status === 'OPEN'), [signals]);
+  const openMt5Trades = useMemo(
+    () =>
+      (data?.trades ?? [])
+        .filter((trade) => trade.status === 'OPEN')
+        .sort((a, b) => a.openedAt - b.openedAt),
+    [data?.trades]
+  );
+  const openUnmatchedTrades = useMemo(
+    () =>
+      openMt5Trades.filter(
+        (trade) =>
+          !openSignals.some(
+            (signal) =>
+              sameInstrument(trade.symbol, signal.symbol) &&
+              (trade.direction === 'LONG') === (signal.direction === 'LONG')
+          )
+      ),
+    [openSignals, openMt5Trades]
+  );
 
   const filteredSignals = useMemo(() => {
     if (filter === 'ALL') return signals;
@@ -570,6 +621,36 @@ export const LiveSignalsViewer: React.FC = () => {
     [status, tapeTotals]
   );
 
+  const brokerTotals = useMemo(() => {
+    const trades = data?.trades ?? [];
+    return {
+      total: trades.length,
+      tp: trades.filter((trade) => trade.status === 'CLOSED' && trade.outcome === 'TP_HIT').length,
+      sl: trades.filter((trade) => trade.status === 'CLOSED' && trade.outcome === 'SL_HIT').length,
+      breakeven: trades.filter(
+        (trade) => trade.status === 'CLOSED' && trade.outcome === 'BREAKEVEN_HIT'
+      ).length,
+      open: trades.filter((trade) => trade.status === 'OPEN').length,
+      ambiguous: trades.filter(
+        (trade) => trade.status === 'CLOSED' && trade.outcome === 'AMBIGUOUS'
+      ).length,
+      expired: trades.filter((trade) => trade.status === 'CLOSED' && trade.outcome === 'EXPIRED').length,
+    };
+  }, [data?.trades]);
+
+  const activityTotals = useMemo(
+    () => ({
+      total: Math.max(engineTotals.total, brokerTotals.total),
+      tp: Math.max(engineTotals.tp, brokerTotals.tp),
+      sl: Math.max(engineTotals.sl, brokerTotals.sl),
+      breakeven: Math.max(engineTotals.breakeven, brokerTotals.breakeven),
+      open: Math.max(engineTotals.open, brokerTotals.open),
+      ambiguous: Math.max(engineTotals.ambiguous, brokerTotals.ambiguous),
+      expired: Math.max(engineTotals.expired, brokerTotals.expired),
+    }),
+    [engineTotals, brokerTotals]
+  );
+
   return (
     <div className="space-y-6 sm:space-y-8">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
@@ -578,7 +659,7 @@ export const LiveSignalsViewer: React.FC = () => {
             Live Signals
           </h1>
           <p className="mt-1.5 text-[13px] leading-5 text-[#6e6e73]">
-            Forex and CFD signals. 5% balance risk · per-pair SL · 2R TP.
+            Forex and CFD signals. {data?.riskPercent ?? 5}% balance risk · per-pair SL · 2R TP.
           </p>
         </div>
         <div className="grid grid-cols-2 gap-2 sm:flex">
@@ -639,14 +720,42 @@ export const LiveSignalsViewer: React.FC = () => {
               label="Open P&L"
               value={formatAccountMoney(data.account.unrealizedPnl, data.account.currency)}
               accent={data.account.unrealizedPnl >= 0 ? 'text-[#1d8f3a]' : 'text-[#d70015]'}
+              style={pnlTintStyle(data.account.unrealizedPnl)}
               icon={<TrendingUp className="h-4 w-4" strokeWidth={1.7} />}
             />
             <StatCard
-              label="Realized P&L"
+              label="Realized (all)"
               value={formatAccountMoney(data.account.realizedPnl, data.account.currency)}
               accent={data.account.realizedPnl >= 0 ? 'text-[#1d8f3a]' : 'text-[#d70015]'}
               icon={<CheckCircle2 className="h-4 w-4" strokeWidth={1.7} />}
             />
+          </div>
+          <div className="mt-2.5 grid grid-cols-1 gap-2.5 rounded-2xl border border-black/[0.06] bg-white p-4 sm:grid-cols-3 sm:gap-3 sm:p-5">
+            {(
+              [
+                ['Today', data.account.realizedPnlToday, data.account.closedTradesToday],
+                ['This week', data.account.realizedPnlWeek, data.account.closedTradesWeek],
+                ['This month', data.account.realizedPnlMonth, data.account.closedTradesMonth],
+              ] as Array<[string, number, number]>
+            ).map(([label, pnl, count]) => (
+              <div key={label} className="rounded-xl bg-[#f5f5f7] px-3 py-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-[#86868b] sm:text-[11px]">
+                    {label}
+                  </span>
+                  <span className="text-[10px] text-[#aeaeb2] sm:text-[11px]">
+                    {count} closed
+                  </span>
+                </div>
+                <div
+                  className={`mt-1.5 text-[18px] font-semibold leading-none tracking-[-0.03em] tabular-nums sm:text-[20px] ${
+                    pnl >= 0 ? 'text-[#1d8f3a]' : 'text-[#d70015]'
+                  }`}
+                >
+                  {formatAccountMoney(pnl, data.account?.currency)}
+                </div>
+              </div>
+            ))}
           </div>
         </section>
       )}
@@ -664,35 +773,35 @@ export const LiveSignalsViewer: React.FC = () => {
       <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 sm:gap-3 lg:grid-cols-6">
         <StatCard
           label="Open"
-          value={loading ? '—' : engineTotals.open}
+          value={loading ? '—' : activityTotals.open}
           icon={<Activity className="h-4 w-4" strokeWidth={1.7} />}
         />
         <StatCard
           label="TP"
-          value={loading ? '—' : engineTotals.tp}
-          accent={engineTotals.tp > 0 ? 'text-[#1d8f3a]' : undefined}
+          value={loading ? '—' : activityTotals.tp}
+          accent={activityTotals.tp > 0 ? 'text-[#1d8f3a]' : undefined}
           icon={<BullIcon size={16} />}
         />
         <StatCard
           label="SL"
-          value={loading ? '—' : engineTotals.sl}
-          accent={engineTotals.sl > 0 ? 'text-[#d70015]' : undefined}
+          value={loading ? '—' : activityTotals.sl}
+          accent={activityTotals.sl > 0 ? 'text-[#d70015]' : undefined}
           icon={<BearIcon size={16} />}
         />
         <StatCard
           label="Breakeven"
-          value={loading ? '—' : engineTotals.breakeven}
-          accent={engineTotals.breakeven > 0 ? 'text-[#6e56cf]' : undefined}
+          value={loading ? '—' : activityTotals.breakeven}
+          accent={activityTotals.breakeven > 0 ? 'text-[#6e56cf]' : undefined}
           icon={<MinusCircle className="h-4 w-4" strokeWidth={1.7} />}
         />
         <StatCard
           label="Ambiguous"
-          value={loading ? '—' : engineTotals.ambiguous}
+          value={loading ? '—' : activityTotals.ambiguous}
           icon={<AlertTriangle className="h-4 w-4" strokeWidth={1.7} />}
         />
         <StatCard
           label="Expired"
-          value={loading ? '—' : engineTotals.expired}
+          value={loading ? '—' : activityTotals.expired}
           icon={<Clock className="h-4 w-4" strokeWidth={1.7} />}
         />
       </div>
@@ -747,16 +856,96 @@ export const LiveSignalsViewer: React.FC = () => {
             <h2 className="text-[16px] font-semibold tracking-[-0.01em] text-[#1d1d1f] sm:text-[17px]">
               Open positions
             </h2>
-            <span className="text-[11px] text-[#86868b]">{openSignals.length}</span>
+            <span className="text-[11px] text-[#86868b]">
+              {openSignals.length + openUnmatchedTrades.length}
+            </span>
           </div>
         </div>
 
-        {openSignals.length > 0 ? (
-          <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2 md:gap-3 xl:grid-cols-3">
-            {openSignals.map((signal) => (
-              <SignalCard key={signal.id} signal={signal} now={now} />
-            ))}
-          </div>
+        {openSignals.length + openUnmatchedTrades.length > 0 ? (
+          <>
+            {openSignals.length > 0 && (
+              <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2 md:gap-3 xl:grid-cols-3">
+                {openSignals.map((signal) => (
+                  <SignalCard key={signal.id} signal={signal} now={now} />
+                ))}
+              </div>
+            )}
+            {openUnmatchedTrades.length > 0 && (
+              <div
+                className={`grid grid-cols-1 gap-2.5 md:grid-cols-2 md:gap-3 xl:grid-cols-3 ${
+                  openSignals.length > 0 ? 'mt-2.5' : ''
+                }`}
+              >
+                {openUnmatchedTrades.map((trade: Mt5Trade) => {
+                  const isLong = trade.direction === 'LONG';
+                  const livePnl = trade.unrealizedPnl;
+                  const beast = isLong ? <BullIcon size={52} animated /> : <BearIcon size={52} animated flip />;
+                  return (
+                    <div
+                      key={trade.id}
+                      style={pnlTintStyle(livePnl)}
+                      className="rounded-2xl border border-black/[0.06] bg-white px-3.5 py-3"
+                    >
+                      <div className="flex items-start gap-3">
+                        {isLong && (
+                          <span className="flex h-[64px] w-[64px] shrink-0 items-center justify-center rounded-xl bg-gradient-to-b from-[#f2fff5] to-[#ddf5e3] ring-1 ring-inset ring-[#1d8f3a]/15">
+                            {beast}
+                          </span>
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                            <span className="text-[13px] font-semibold text-[#1d1d1f]">
+                              {trade.symbol}
+                            </span>
+                            <span
+                              className={`inline-flex items-center gap-1 text-[10px] font-medium ${
+                                isLong ? 'text-[#1d8f3a]' : 'text-[#d70015]'
+                              }`}
+                            >
+                              {isLong ? <BullIcon size={11} /> : <BearIcon size={11} />}
+                              {isLong ? 'Long' : 'Short'}
+                            </span>
+                          </div>
+                          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] tabular-nums text-[#6e6e73]">
+                            <span>{trade.lotSize.toFixed(2)} lots</span>
+                            <span>entry {formatPrice(trade.entryPrice)}</span>
+                            {trade.mt5Ticket !== null && (
+                              <span className="font-mono text-[9px] text-[#86868b]">
+                                #{trade.mt5Ticket}
+                              </span>
+                            )}
+                            <span>{timeAgo(trade.openedAt, now)}</span>
+                          </div>
+                        </div>
+                        {!isLong && (
+                          <span className="flex h-[64px] w-[64px] shrink-0 items-center justify-center rounded-xl bg-gradient-to-b from-[#fff5f4] to-[#f7dcd9] ring-1 ring-inset ring-[#d70015]/15">
+                            {beast}
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-2.5 flex items-center justify-between rounded-xl bg-black/[0.03] px-3 py-2">
+                        <span className="text-[9px] font-medium uppercase tracking-[0.08em] text-[#86868b]">
+                          Live P&L
+                        </span>
+                        <span
+                          className={`text-[17px] font-semibold leading-none tabular-nums ${
+                            livePnl > 0
+                              ? 'text-[#1d8f3a]'
+                              : livePnl < 0
+                                ? 'text-[#d70015]'
+                                : 'text-[#6e6e73]'
+                          }`}
+                        >
+                          {formatMoney(livePnl)}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </>
         ) : (
           <div className="flex flex-col items-center justify-center gap-3 rounded-2xl border border-black/[0.06] bg-white px-4 py-12 text-center">
             <span className="flex h-10 w-10 items-center justify-center rounded-full bg-[#f5f5f7]">

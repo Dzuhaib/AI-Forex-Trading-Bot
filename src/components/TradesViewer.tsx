@@ -48,6 +48,23 @@ function pnlClass(value: number): string {
   return 'text-[#6e6e73]';
 }
 
+function pnlTintStyle(value: number): React.CSSProperties {
+  if (!Number.isFinite(value) || value === 0) return {};
+  const positive = value > 0;
+  const magnitude = Math.min(1, Math.abs(value) / 60);
+  const alpha = 0.05 + magnitude * 0.22;
+  const accent = 0.25 + magnitude * 0.45;
+  const rgb = positive ? '52, 199, 89' : '255, 59, 48';
+  return {
+    backgroundImage: `linear-gradient(90deg, rgba(${rgb}, ${alpha}) 0%, rgba(${rgb}, ${
+      alpha * 0.2
+    }) 100%)`,
+    borderColor: `rgba(${rgb}, ${accent})`,
+    boxShadow: `inset 3px 0 0 rgba(${rgb}, ${accent})`,
+    transition: 'background-image 400ms ease, border-color 400ms ease, box-shadow 400ms ease',
+  };
+}
+
 function clock(ms: number | null): string {
   if (!ms) return '—';
   const date = new Date(ms);
@@ -73,14 +90,19 @@ function AccountCard({
   value,
   accent,
   icon,
+  style,
 }: {
   label: string;
   value: string;
   accent: string;
   icon: React.ReactNode;
+  style?: React.CSSProperties;
 }) {
   return (
-    <div className="rounded-2xl border border-black/[0.06] bg-white p-4 sm:p-5">
+    <div
+      style={style}
+      className="rounded-2xl border border-black/[0.06] bg-white p-4 sm:p-5"
+    >
       <div className="flex items-center justify-between gap-2">
         <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-[#86868b] sm:text-[11px]">
           {label}
@@ -190,7 +212,10 @@ function TradeTable({
               const isLong = trade.direction === 'LONG';
               const displayPnl = trade.status === 'OPEN' ? trade.unrealizedPnl : trade.pnl;
               return (
-                <tr key={trade.id}>
+                <tr
+                  key={trade.id}
+                  style={trade.status === 'OPEN' ? pnlTintStyle(displayPnl) : undefined}
+                >
                   <td className="whitespace-nowrap px-4 py-3">
                     <div className="font-semibold text-[#1d1d1f]">{trade.symbol}</div>
                     {trade.mt5Ticket !== null ? (
@@ -293,7 +318,11 @@ function TradeCards({
         const displayPnl = trade.status === 'OPEN' ? trade.unrealizedPnl : trade.pnl;
 
         return (
-          <div key={trade.id} className="rounded-2xl border border-black/[0.06] bg-white p-4">
+          <div
+            key={trade.id}
+            style={trade.status === 'OPEN' ? pnlTintStyle(displayPnl) : undefined}
+            className="rounded-2xl border border-black/[0.06] bg-white p-4"
+          >
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="flex items-center gap-2">
@@ -378,12 +407,21 @@ function TradeCards({
   );
 }
 
+function formatDay(date: string): string {
+  const [year, month, day] = date.split('-').map(Number);
+  if (!year || !month || !day) return date;
+  return new Date(year, month - 1, day).toLocaleDateString();
+}
+
 export const TradesViewer: React.FC = () => {
   const [data, setData] = useState<SignalsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [now, setNow] = useState(() => Date.now());
   const [historyPage, setHistoryPage] = useState(1);
+  const [riskDraft, setRiskDraft] = useState('');
+  const [riskBusy, setRiskBusy] = useState(false);
+  const [riskError, setRiskError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -413,6 +451,7 @@ export const TradesViewer: React.FC = () => {
   const mt5 = data?.mt5 ?? null;
   const mt5Account = mt5?.connected ? mt5.account : null;
   const mt5Connected = Boolean(mt5Account);
+  const riskPercent = data?.riskPercent ?? account?.riskPercent ?? 5;
   const openTrades = useMemo(() => trades.filter((trade) => trade.status === 'OPEN'), [trades]);
   const closedTrades = useMemo(
     () =>
@@ -437,6 +476,41 @@ export const TradesViewer: React.FC = () => {
     setHistoryPage(1);
   }, [mt5Connected]);
 
+  useEffect(() => {
+    setRiskDraft(String(riskPercent));
+  }, [riskPercent]);
+
+  const updateRisk = async () => {
+    setRiskError(null);
+    const value = Number(riskDraft);
+    if (!Number.isFinite(value) || value < 0.1 || value > 100) {
+      setRiskError('Enter a risk percentage between 0.1 and 100.');
+      return;
+    }
+    setRiskBusy(true);
+    try {
+      const response = await fetch('/api/risk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ riskPercent: value }),
+      });
+      const payload = (await response.json().catch(() => null)) as
+        | { ok?: boolean; riskPercent?: number; error?: string }
+        | null;
+      if (!response.ok) {
+        throw new Error(payload?.error ?? `Request failed (HTTP ${response.status}).`);
+      }
+      if (typeof payload?.riskPercent === 'number') {
+        setRiskDraft(String(payload.riskPercent));
+      }
+      await load();
+    } catch (err) {
+      setRiskError(err instanceof Error ? err.message : 'Updating the risk percentage failed.');
+    } finally {
+      setRiskBusy(false);
+    }
+  };
+
   const mt5Label =
     mt5Connected
       ? `MT5 · #${mt5Account?.login}`
@@ -460,7 +534,7 @@ export const TradesViewer: React.FC = () => {
             Trades
           </h1>
           <p className="mt-1.5 text-[13px] text-[#6e6e73]">
-            Auto lots · {account?.riskPercent ?? 5}% balance risk · per-pair SL · 2R TP
+            Auto lots · {riskPercent}% balance risk · per-pair SL · 2R TP
           </p>
         </div>
         <div className="grid grid-cols-2 gap-2 sm:flex">
@@ -517,7 +591,7 @@ export const TradesViewer: React.FC = () => {
           <div className="rounded-xl bg-[#f5f5f7] px-3 py-2">
             <div className="text-[9px] uppercase tracking-[0.06em] text-[#86868b]">Risk</div>
             <div className="mt-0.5 text-[13px] font-semibold tabular-nums text-[#1d1d1f]">
-              {account?.riskPercent ?? 5}%
+              {riskPercent}%
             </div>
           </div>
           <div className="rounded-xl bg-[#f5f5f7] px-3 py-2">
@@ -541,6 +615,48 @@ export const TradesViewer: React.FC = () => {
             <div className="mt-0.5 text-[13px] font-semibold tabular-nums text-[#1d1d1f]">1:2</div>
           </div>
         </div>
+
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void updateRisk();
+          }}
+          className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end"
+        >
+          <label className="block sm:max-w-[220px]">
+            <span className="text-[10px] font-medium uppercase tracking-[0.06em] text-[#86868b]">
+              Risk per trade (%)
+            </span>
+            <div className="mt-1 flex items-center gap-2 rounded-xl bg-[#f5f5f7] px-3">
+              <input
+                value={riskDraft}
+                onChange={(event) => setRiskDraft(event.target.value)}
+                type="number"
+                min="0.1"
+                max="100"
+                step="0.1"
+                inputMode="decimal"
+                disabled={riskBusy}
+                className="h-10 w-full bg-transparent text-[13px] tabular-nums text-[#1d1d1f] focus:outline-none disabled:opacity-50"
+              />
+              <span className="text-[12px] font-medium text-[#86868b]">%</span>
+            </div>
+          </label>
+          <button
+            type="submit"
+            disabled={riskBusy}
+            className="inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-full bg-[#1d1d1f] px-5 text-[13px] font-medium text-white active:opacity-70 disabled:opacity-40"
+          >
+            {riskBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+            Apply risk
+          </button>
+        </form>
+        {riskError && (
+          <div className="mt-2 flex items-start gap-2 text-[11px] leading-5 text-[#d70015]">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+            <span>{riskError}</span>
+          </div>
+        )}
       </div>
 
       {mt5Connected && mt5Account ? (
@@ -561,6 +677,7 @@ export const TradesViewer: React.FC = () => {
             label="Floating P&L"
             value={accountMoney(mt5Account.profit, mt5Account.currency)}
             accent={pnlClass(mt5Account.profit)}
+            style={pnlTintStyle(mt5Account.profit)}
             icon={<TrendingUp className="h-4 w-4" strokeWidth={1.7} />}
           />
           <AccountCard
@@ -583,6 +700,66 @@ export const TradesViewer: React.FC = () => {
           />
         </div>
       ) : null}
+
+      {mt5Connected && account && (account.dailyPnl ?? []).length > 0 && (
+        <section>
+          <div className="mb-3 flex items-baseline justify-between gap-2">
+            <div className="flex items-baseline gap-2">
+              <h2 className="text-[16px] font-semibold tracking-[-0.01em] text-[#1d1d1f] sm:text-[17px]">
+                Daily P&L
+              </h2>
+              <span className="text-[11px] text-[#86868b]">{account.dailyPnl.length} days</span>
+            </div>
+            {!account.historyFull && (
+              <span className="text-[10px] text-[#86868b]">
+                Loading full account history...
+              </span>
+            )}
+          </div>
+          <div className="overflow-hidden rounded-2xl border border-black/[0.06] bg-white">
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-black/[0.06] text-left text-[12px]">
+                <thead className="bg-[#fafafa] text-[10px] uppercase tracking-[0.06em] text-[#86868b]">
+                  <tr>
+                    <th className="px-4 py-3 font-medium">Day</th>
+                    <th className="px-4 py-3 text-right font-medium">Closed trades</th>
+                    <th className="px-4 py-3 text-right font-medium">Win rate</th>
+                    <th className="px-4 py-3 text-right font-medium">P&L</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-black/[0.05]">
+                  {account.dailyPnl.map((entry) => (
+                    <tr key={entry.date}>
+                      <td className="whitespace-nowrap px-4 py-2.5 font-semibold text-[#1d1d1f]">
+                        {formatDay(entry.date)}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-[#6e6e73]">
+                        {entry.trades}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums text-[#6e6e73]">
+                        {entry.trades > 0 ? `${Math.round((entry.wins / entry.trades) * 100)}%` : '—'}
+                      </td>
+                      <td
+                        className={`whitespace-nowrap px-4 py-2.5 text-right font-medium tabular-nums ${pnlClass(
+                          entry.pnl
+                        )}`}
+                      >
+                        {money(entry.pnl)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div className="mt-2 text-right text-[10px] text-[#86868b]">
+            <span className="inline-flex items-center gap-1.5">
+              <Loader2 className="h-3 w-3" />
+              Daily P&L updates automatically with every history sync.
+            </span>
+          </div>
+        </section>
+      )}
 
       <section>
         <div className="mb-3 flex items-baseline gap-2">

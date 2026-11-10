@@ -1,6 +1,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import path from 'path';
 import readline from 'readline';
+import {
+  loadAccountHistory,
+  mergeAccountDeals,
+  saveAccountHistory,
+  type Mt5DealRecord,
+} from './mt5HistoryStore';
 import type {
   AccountSummary,
   Mt5Trade,
@@ -8,6 +14,8 @@ import type {
   Mt5Position,
   Mt5Status,
   Mt5Terminal,
+  DailyPnlEntry,
+  SignalStatus,
 } from './src/types';
 
 type BridgeResponse = {
@@ -149,6 +157,8 @@ export type Mt5OrderInput = {
   volume: number;
   sl: number;
   tp: number;
+  slDistance?: number;
+  tpDistance?: number;
   deviation?: number;
 };
 
@@ -179,6 +189,7 @@ export type Mt5SymbolInfo = {
   volumeMin: number;
   volumeStep: number;
   tradeMode: number;
+  stopsLevel: number;
   bid: number;
   ask: number;
   last: number;
@@ -196,26 +207,17 @@ export type Mt5Candle = {
   volume: number;
 };
 
-type Mt5Deal = {
-  positionId: number;
-  ticket: number;
-  symbol: string;
-  type: 'BUY' | 'SELL';
-  volume: number;
-  price: number;
-  profit: number;
-  swap: number;
-  commission: number;
-  fee: number;
-  entry: number;
-  time: number;
-  comment: string;
-  magic: number;
-};
+type Mt5Deal = Mt5DealRecord;
 
-const HISTORY_DAYS = 90;
+const HISTORY_DAYS_LIMIT = 5;
 const HISTORY_TTL_MS = 30_000;
+const DAILY_PNL_DAYS = 30;
+const SYNC_FAILURE_LIMIT = 3;
+const RECONNECT_DELAY_MS = 15_000;
 const MT5_RISK_PERCENT = 5;
+const DEAL_REASON_SL = 4;
+const DEAL_REASON_TP = 5;
+const DEAL_REASON_STOPOUT = 6;
 
 function roundMoney(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
@@ -249,8 +251,19 @@ export class Mt5Broker {
   private pollTimer: NodeJS.Timeout | null = null;
   private pollBusy = false;
   private connecting = false;
+  private syncFailures = 0;
+  private reconnectTimer: NodeJS.Timeout | null = null;
   private history: Mt5Deal[] = [];
+  private historyByLogin = new Map<number, Mt5Deal[]>();
+  private fullHistoryLoaded = new Set<number>();
   private historyFetchedAt = 0;
+  private historySyncAt = 0;
+  private closedTradeCache: {
+    positionsKey: string;
+    closedTrades: Mt5Trade[];
+    allTrades: Mt5Trade[];
+    dailyPnl: DailyPnlEntry[];
+  } | null = null;
 
   isConnected(): boolean {
     return this.status.state === 'CONNECTED' && this.status.account !== null;
@@ -267,14 +280,43 @@ export class Mt5Broker {
     return this.isConnected() ? (this.status.account?.balance ?? null) : null;
   }
 
+  private setHistory(deals: Mt5Deal[]): void {
+    this.history = deals;
+    this.closedTradeCache = null;
+  }
+
+  private async syncFullHistory(login: number): Promise<Mt5Deal[]> {
+    if (!this.bridge) return this.history;
+    try {
+      const history = await this.bridge.request<{ deals: Mt5Deal[] }>(
+        'history',
+        { days: 'all' },
+        120_000
+      );
+      const merged = mergeAccountDeals(this.history, history.deals);
+      this.fullHistoryLoaded.add(login);
+      saveAccountHistory(login, this.status.account?.server ?? '', merged);
+      return merged;
+    } catch {
+      // Fall back to the store-backed history and remember it is not complete.
+      return this.history;
+    }
+  }
+
   getAccountSnapshot(): { account: AccountSummary; trades: Mt5Trade[] } | null {
     const mt5Account = this.status.account;
     if (!this.isConnected() || !mt5Account) return null;
 
     const openTickets = new Set(this.status.positions.map((position) => position.ticket));
     const openTrades = this.status.positions.map((position) => this.mapOpenPosition(position));
-    const closedTrades = this.mapClosedTrades(openTickets);
-    const trades = [...openTrades, ...closedTrades].sort((a, b) => {
+    const closedInfo = this.getClosedTrades(openTickets);
+    const closedTrades = closedInfo.closedTrades;
+    const trades = [
+      ...openTrades,
+      ...closedTrades.filter(
+        (trade) => !openTrades.some((open) => open.mt5Ticket === trade.mt5Ticket)
+      ),
+    ].sort((a, b) => {
       if (a.status === 'OPEN' && b.status !== 'OPEN') return -1;
       if (a.status !== 'OPEN' && b.status === 'OPEN') return 1;
       return (b.closedAt ?? b.openedAt) - (a.closedAt ?? a.openedAt);
@@ -286,18 +328,87 @@ export class Mt5Broker {
     const unrealizedPnl = roundMoney(
       openTrades.reduce((sum, trade) => sum + trade.unrealizedPnl, 0)
     );
+    const now = Date.now();
+    const startOfToday = new Date(now);
+    startOfToday.setHours(0, 0, 0, 0);
+    const startOfWeek = new Date(startOfToday);
+    startOfWeek.setDate(startOfWeek.getDate() - ((startOfWeek.getDay() + 6) % 7));
+    const startOfMonth = new Date(startOfToday.getFullYear(), startOfToday.getMonth(), 1);
+
+    const periodStats = (since: number) => {
+      const inPeriod = closedTrades.filter((trade) => (trade.closedAt ?? 0) >= since);
+      return {
+        pnl: roundMoney(inPeriod.reduce((sum, trade) => sum + trade.pnl, 0)),
+        count: inPeriod.length,
+      };
+    };
+    const today = periodStats(startOfToday.getTime());
+    const week = periodStats(startOfWeek.getTime());
+    const month = periodStats(startOfMonth.getTime());
+
     const account: AccountSummary = {
       balance: roundMoney(mt5Account.balance),
       equity: roundMoney(mt5Account.equity),
       unrealizedPnl,
       realizedPnl,
+      realizedPnlToday: today.pnl,
+      realizedPnlWeek: week.pnl,
+      realizedPnlMonth: month.pnl,
+      closedTradesToday: today.count,
+      closedTradesWeek: week.count,
+      closedTradesMonth: month.count,
       openTrades: openTrades.length,
       closedTrades: closedTrades.length,
       riskPercent: MT5_RISK_PERCENT,
       currency: mt5Account.currency || 'USD',
+      dailyPnl: closedInfo.dailyPnl,
+      historyFull: this.currentLogin() !== null && this.fullHistoryLoaded.has(this.currentLogin() as number),
+      historySyncedAt: this.historySyncAt || null,
     };
 
     return { account, trades };
+  }
+
+  private currentLogin(): number | null {
+    const login = this.status.account?.login;
+    return typeof login === 'number' && login > 0 ? login : null;
+  }
+
+  private buildDailyPnl(closedTrades: Mt5Trade[]): DailyPnlEntry[] {
+    const buckets = new Map<string, DailyPnlEntry>();
+    const cutoff = Date.now() - DAILY_PNL_DAYS * 86_400_000;
+    for (const trade of closedTrades) {
+      if (trade.status !== 'CLOSED') continue;
+      const closedAt = trade.closedAt ?? 0;
+      if (!closedAt || closedAt < cutoff) continue;
+      const date = new Date(closedAt);
+      const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(
+        date.getDate()
+      ).padStart(2, '0')}`;
+      const entry = buckets.get(key) ?? { date: key, pnl: 0, trades: 0, wins: 0 };
+      entry.pnl += trade.pnl;
+      entry.trades += 1;
+      if (trade.pnl > 0) entry.wins += 1;
+      buckets.set(key, entry);
+    }
+    return [...buckets.values()]
+      .map((entry) => ({ ...entry, pnl: roundMoney(entry.pnl) }))
+      .sort((a, b) => b.date.localeCompare(a.date))
+      .slice(0, DAILY_PNL_DAYS);
+  }
+
+  private getClosedTrades(openTickets: Set<number>): {
+    closedTrades: Mt5Trade[];
+    dailyPnl: DailyPnlEntry[];
+  } {
+    const positionsKey = [...openTickets].sort((a, b) => a - b).join(',');
+    if (this.closedTradeCache && this.closedTradeCache.positionsKey === positionsKey) {
+      return { closedTrades: this.closedTradeCache.closedTrades, dailyPnl: this.closedTradeCache.dailyPnl };
+    }
+    const closedTrades = this.mapClosedTrades(openTickets);
+    const dailyPnl = this.buildDailyPnl(closedTrades);
+    this.closedTradeCache = { positionsKey, closedTrades, allTrades: [], dailyPnl };
+    return { closedTrades, dailyPnl };
   }
 
   private mapOpenPosition(position: Mt5Position): Mt5Trade {
@@ -351,7 +462,11 @@ export class Mt5Broker {
       const totalVolume = inVolume > 0 ? inVolume : outVolume;
 
       const inDeal = inDeals[0];
-      const outDeal = outDeals[0];
+      // The final exit deal decides the outcome reason, not the first one.
+      const outDeal = outDeals.reduce(
+        (latest, deal) => (deal.time >= latest.time ? deal : latest),
+        outDeals[0]
+      );
       const direction = inDeal
         ? inDeal.type === 'BUY'
           ? 'LONG'
@@ -374,6 +489,29 @@ export class Mt5Broker {
       const openedAt = Math.min(...deals.map((deal) => deal.time));
       const closedAt = Math.max(...outDeals.map((deal) => deal.time));
       const symbol = outDeal.symbol || deals[0].symbol;
+      const priceMove = (exitPrice - entryPrice) * (direction === 'LONG' ? 1 : -1);
+      const breakevenTolerance = Math.abs(entryPrice) * 0.00001;
+      const nearEntry = Math.abs(priceMove) <= breakevenTolerance;
+      const reason = outDeal.reason;
+      const manualClose = reason >= 0 && reason <= 3; // client / mobile / web / expert closes
+      const outcome: SignalStatus =
+        reason === DEAL_REASON_TP
+          ? 'TP_HIT'
+          : reason === DEAL_REASON_SL
+            ? priceMove > -breakevenTolerance
+              ? 'BREAKEVEN_HIT'
+              : 'SL_HIT'
+            : reason === DEAL_REASON_STOPOUT
+              ? 'SL_HIT'
+              : nearEntry
+                ? 'BREAKEVEN_HIT'
+                : manualClose
+                  ? priceMove > 0
+                    ? 'EXPIRED'
+                    : 'SL_HIT'
+                  : priceMove > 0
+                    ? 'TP_HIT'
+                    : 'SL_HIT';
 
       trades.push({
         id: `mt5-close-${positionId}`,
@@ -390,7 +528,7 @@ export class Mt5Broker {
         closedAtUtc: new Date(closedAt).toISOString(),
         exitPrice,
         status: 'CLOSED',
-        outcome: null,
+        outcome,
         pnl,
         unrealizedPnl: 0,
         balanceAfter: null,
@@ -402,7 +540,7 @@ export class Mt5Broker {
       });
     }
 
-    return trades.sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0)).slice(0, 500);
+    return trades.sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0));
   }
 
   async connect(input: Mt5ConnectInput): Promise<Mt5MutationResult> {
@@ -426,6 +564,7 @@ export class Mt5Broker {
 
     this.connecting = true;
     this.stopPolling();
+    this.clearReconnectTimer();
     if (this.bridge) {
       try {
         await this.bridge.request('disconnect', {}, 5_000);
@@ -436,7 +575,9 @@ export class Mt5Broker {
       this.bridge = null;
     }
 
-    this.history = [];
+    this.history = this.historyByLogin.get(login) ?? loadAccountHistory(login);
+    this.historyByLogin.set(login, this.history);
+    this.closedTradeCache = null;
     this.historyFetchedAt = 0;
     this.status = {
       ...DISCONNECTED_STATUS,
@@ -460,20 +601,12 @@ export class Mt5Broker {
         {},
         20_000
       );
-      let historyDeals: Mt5Deal[] = [];
-      try {
-        const history = await bridge.request<{ deals: Mt5Deal[] }>(
-          'history',
-          { days: HISTORY_DAYS },
-          30_000
-        );
-        historyDeals = history.deals;
-      } catch {
-        historyDeals = [];
-      }
       this.bridge = bridge;
-      this.history = historyDeals;
+      this.setHistory(await this.syncFullHistory(login));
+      this.historySyncAt = Date.now();
       this.historyFetchedAt = Date.now();
+      this.historyByLogin.set(login, this.history);
+      this.syncFailures = 0;
       this.status = {
         state: 'CONNECTED',
         connected: true,
@@ -512,6 +645,7 @@ export class Mt5Broker {
 
     this.connecting = true;
     this.stopPolling();
+    this.clearReconnectTimer();
     if (this.bridge) {
       try {
         await this.bridge.request('disconnect', {}, 5_000);
@@ -536,25 +670,23 @@ export class Mt5Broker {
         account: Mt5Account;
         terminal: Mt5Terminal;
       }>('attach', { terminalPath }, 60_000);
+      const login = attached.account.login;
+      this.history = this.historyByLogin.get(login) ?? loadAccountHistory(login);
+      this.historyByLogin.set(login, this.history);
+      this.closedTradeCache = null;
+      this.historyFetchedAt = 0;
+
       const positions = await bridge.request<{ positions: Mt5Position[] }>(
         'positions',
         {},
         20_000
       );
-      let historyDeals: Mt5Deal[] = [];
-      try {
-        const history = await bridge.request<{ deals: Mt5Deal[] }>(
-          'history',
-          { days: HISTORY_DAYS },
-          30_000
-        );
-        historyDeals = history.deals;
-      } catch {
-        historyDeals = [];
-      }
       this.bridge = bridge;
-      this.history = historyDeals;
+      this.setHistory(await this.syncFullHistory(login));
+      this.historySyncAt = Date.now();
       this.historyFetchedAt = Date.now();
+      this.historyByLogin.set(login, this.history);
+      this.syncFailures = 0;
       this.status = {
         state: 'CONNECTED',
         connected: true,
@@ -562,7 +694,7 @@ export class Mt5Broker {
         terminal: attached.terminal,
         positions: positions.positions,
         config: {
-          login: attached.account.login,
+          login,
           server: attached.account.server,
           terminalPath,
           symbolSuffix,
@@ -590,10 +722,13 @@ export class Mt5Broker {
 
   async disconnect(): Promise<Mt5MutationResult> {
     this.stopPolling();
+    this.clearReconnectTimer();
     const bridge = this.bridge;
     this.bridge = null;
     this.history = [];
     this.historyFetchedAt = 0;
+    this.closedTradeCache = null;
+    this.syncFailures = 0;
     if (bridge) {
       try {
         await bridge.request('disconnect', {}, 5_000);
@@ -667,8 +802,11 @@ export class Mt5Broker {
         volume: order.volume,
         sl: order.sl,
         tp: order.tp,
+        slDistance: order.slDistance,
+        tpDistance: order.tpDistance,
         deviation: order.deviation ?? 20,
         suffix: this.status.config?.symbolSuffix ?? '',
+        dedupe: 1,
       },
       60_000
     );
@@ -724,18 +862,27 @@ export class Mt5Broker {
         bridge.request<{ positions: Mt5Position[] }>('positions', {}, 20_000),
       ]);
       if (Date.now() - this.historyFetchedAt > HISTORY_TTL_MS) {
-        try {
-          const history = await bridge.request<{ deals: Mt5Deal[] }>(
-            'history',
-            { days: HISTORY_DAYS },
-            30_000
-          );
-          this.history = history.deals;
-          this.historyFetchedAt = Date.now();
-        } catch {
-          // Keep the previous history snapshot if the broker call fails.
+        this.historyFetchedAt = Date.now();
+        const login = this.currentLogin();
+        if (login !== null) {
+          try {
+            const incremental = await bridge.request<{ deals: Mt5Deal[] }>(
+              'history',
+              { days: HISTORY_DAYS_LIMIT },
+              30_000
+            );
+            const merged = mergeAccountDeals(this.history, incremental.deals);
+            if (merged.length !== this.history.length) {
+              this.setHistory(merged);
+              saveAccountHistory(login, this.status.account?.server ?? '', merged);
+              this.historySyncAt = Date.now();
+            }
+          } catch {
+            // Keep the previous history snapshot if the broker call fails.
+          }
         }
       }
+      this.syncFailures = 0;
       this.status = {
         ...this.status,
         state: 'CONNECTED',
@@ -747,15 +894,48 @@ export class Mt5Broker {
         lastError: null,
       };
     } catch (error) {
-      this.stopPolling();
+      this.syncFailures += 1;
+      const message = error instanceof Error ? error.message : 'MT5 account sync failed.';
       this.status = {
         ...this.status,
-        state: 'ERROR',
-        connected: false,
-        lastError: error instanceof Error ? error.message : 'MT5 account sync failed.',
+        connected: this.isConnected() && this.syncFailures < SYNC_FAILURE_LIMIT,
+        lastError: message,
       };
+      if (this.syncFailures >= SYNC_FAILURE_LIMIT) {
+        this.stopPolling();
+        this.status = { ...this.status, state: 'ERROR', connected: false };
+        this.scheduleReconnect();
+      }
     } finally {
       this.pollBusy = false;
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer || this.connecting) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.isConnected() || this.connecting) return;
+      const config = this.status.config;
+      this.status = {
+        ...this.status,
+        state: 'CONNECTING',
+        connected: false,
+        lastError: 'MT5 connection lost. Reconnecting...',
+      };
+      void this.autoConnect(config?.terminalPath ?? '', config?.symbolSuffix ?? '').then(
+        (result) => {
+          if (result.ok) return;
+          this.scheduleReconnect();
+        }
+      );
+    }, RECONNECT_DELAY_MS);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
   }
 }

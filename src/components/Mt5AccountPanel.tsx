@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
+  ArrowLeftRight,
   CheckCircle2,
   KeyRound,
   Loader2,
@@ -13,7 +14,12 @@ import {
   TrendingUp,
   Wallet,
 } from 'lucide-react';
-import type { Mt5Status } from '../types';
+import type { Mt5AccountMeta, Mt5Status } from '../types';
+
+interface Mt5AccountsResponse {
+  accounts: Mt5AccountMeta[];
+  passwordKnown: number[];
+}
 
 async function postJson<T>(url: string, body: Record<string, unknown> = {}): Promise<T> {
   const response = await fetch(url, {
@@ -69,6 +75,24 @@ export function Mt5AccountPanel({
   const [terminalPath, setTerminalPath] = useState('');
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [knownAccounts, setKnownAccounts] = useState<Mt5AccountsResponse | null>(null);
+  const [switchTarget, setSwitchTarget] = useState<Mt5AccountMeta | null>(null);
+  const [switchPassword, setSwitchPassword] = useState('');
+  const [switchBusy, setSwitchBusy] = useState(false);
+  const [switchError, setSwitchError] = useState<string | null>(null);
+
+  const loadAccounts = useCallback(async () => {
+    try {
+      const response = await fetch('/api/mt5/accounts', { cache: 'no-store' });
+      if (response.ok) setKnownAccounts((await response.json()) as Mt5AccountsResponse);
+    } catch {
+      // The saved-account list is optional; keep the previous one.
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadAccounts();
+  }, [loadAccounts]);
 
   const connected = Boolean(mt5?.connected && mt5.account);
   const account = mt5?.account ?? null;
@@ -87,6 +111,7 @@ export function Mt5AccountPanel({
       });
       setPassword('');
       await onChanged();
+      await loadAccounts();
     } catch (error) {
       setFormError(error instanceof Error ? error.message : 'MT5 connection failed.');
     } finally {
@@ -104,6 +129,36 @@ export function Mt5AccountPanel({
       setFormError(error instanceof Error ? error.message : 'MT5 disconnect failed.');
     } finally {
       setBusy(false);
+    }
+  };
+
+  const submitSwitch = async (target: Mt5AccountMeta, suppliedPassword: string) => {
+    setSwitchError(null);
+    setSwitchBusy(true);
+    try {
+      await postJson('/api/mt5/switch', {
+        login: target.login,
+        server: target.server,
+        password: suppliedPassword,
+      });
+      setSwitchTarget(null);
+      setSwitchPassword('');
+      await onChanged();
+      await loadAccounts();
+    } catch (error) {
+      setSwitchError(error instanceof Error ? error.message : 'Switching accounts failed.');
+    } finally {
+      setSwitchBusy(false);
+    }
+  };
+
+  const startSwitch = (target: Mt5AccountMeta) => {
+    setSwitchError(null);
+    if (knownAccounts?.passwordKnown.includes(target.login)) {
+      void submitSwitch(target, '');
+    } else {
+      setSwitchTarget(target);
+      setSwitchPassword('');
     }
   };
 
@@ -167,6 +222,86 @@ export function Mt5AccountPanel({
         <div className="flex items-start gap-2 px-4 pt-3 text-[11px] leading-5 text-[#d70015] sm:px-5">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
           <span>{formError ?? mt5?.lastError}</span>
+        </div>
+      )}
+
+      {knownAccounts && knownAccounts.accounts.length > 0 && (
+        <div className="border-b border-black/[0.06] px-4 py-3 sm:px-5">
+          <div className="flex items-center gap-2 text-[9px] font-medium uppercase tracking-[0.06em] text-[#86868b]">
+            <ArrowLeftRight className="h-3 w-3" />
+            Saved accounts
+          </div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {knownAccounts.accounts.map((saved) => {
+              const isCurrent = account?.login === saved.login && connected;
+              return (
+                <div
+                  key={`${saved.login}@${saved.server}`}
+                  className="flex items-center gap-3 rounded-xl bg-[#f5f5f7] px-3 py-2"
+                >
+                  <div>
+                    <div className="text-[11px] font-semibold text-[#1d1d1f]">
+                      {saved.name || 'MT5 account'} #{saved.login}
+                    </div>
+                    <div className="text-[9px] text-[#6e6e73]">{saved.server}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!isCurrent) startSwitch(saved);
+                    }}
+                    disabled={isCurrent || switchBusy || busy}
+                    className={`inline-flex h-7 shrink-0 items-center justify-center gap-1.5 rounded-full px-3 text-[10px] font-medium ring-1 ring-inset active:opacity-70 disabled:opacity-50 ${
+                      isCurrent
+                        ? 'bg-white text-[#86868b] ring-black/[0.06]'
+                        : 'bg-white text-[#0071e3] ring-black/10'
+                    }`}
+                  >
+                    {switchBusy ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <ArrowLeftRight className="h-3 w-3" />
+                    )}
+                    {isCurrent ? 'Current' : 'Switch'}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          {switchTarget && (
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (switchTarget) void submitSwitch(switchTarget, switchPassword);
+              }}
+              className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center"
+            >
+              <input
+                value={switchPassword}
+                onChange={(event) => setSwitchPassword(event.target.value)}
+                type="password"
+                autoComplete="current-password"
+                placeholder={`Password for #${switchTarget.login}`}
+                disabled={switchBusy}
+                className="h-9 w-full max-w-[260px] rounded-xl border border-transparent bg-[#f5f5f7] px-3 text-[12px] text-[#1d1d1f] placeholder:text-[#aeaeb2] focus:border-[#0071e3] focus:bg-white focus:outline-none disabled:opacity-50"
+              />
+              <button
+                type="submit"
+                disabled={switchBusy}
+                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-full bg-[#1d1d1f] px-4 text-[12px] font-medium text-white active:opacity-70 disabled:opacity-40"
+              >
+                {switchBusy ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <KeyRound className="h-3.5 w-3.5" />
+                )}
+                Unlock and switch
+              </button>
+            </form>
+          )}
+          {switchError && (
+            <div className="mt-1.5 pb-1 text-[11px] leading-5 text-[#d70015]">{switchError}</div>
+          )}
         </div>
       )}
 
