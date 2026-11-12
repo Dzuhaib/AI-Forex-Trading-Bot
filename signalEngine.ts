@@ -15,6 +15,7 @@ import type {
   NearZone,
   Mt5Position,
   Mt5Status,
+  Mt5Trade,
   PairMutationResult,
   PairsResponse,
   SignalDirection,
@@ -1652,15 +1653,15 @@ export class SignalEngine {
       if (!signalId) continue;
       const signal = this.signals.get(signalId);
       if (!signal) continue;
+      this.reconcileClosedSignal(signal, trade);
       const offset = trade.entryPrice - signal.entry;
       if (
         signal.status === 'TP_HIT' ||
         signal.status === 'SL_HIT' ||
         signal.status === 'BREAKEVEN_HIT'
       ) {
-        // A real loss can never be a breakeven or a TP. If the virtual stop
-        // drifted from the actual broker stop (failed modify), the executed
-        // deal outcome wins.
+        // The executed deal outcome wins whenever the virtual tracking and the
+        // real broker disagree — a real loss is never a TP or breakeven.
         if (!(trade.outcome === 'SL_HIT' && signal.status !== 'SL_HIT')) {
           trade.outcome = signal.status;
         }
@@ -1680,6 +1681,49 @@ export class SignalEngine {
       trades,
       mt5: this.opts.mt5Broker?.getStatus() ?? EMPTY_MT5_STATUS,
     };
+  }
+
+  // Reconciles a virtually resolved signal with the real MT5 deal outcome.
+  // The virtual tracking can drift from the broker (failed SL modify, bid/ask
+  // spread on TP checks, failed close requests), so a signal that claims a win
+  // while the actual position closed in loss must be corrected. The
+  // correction is silent: notifications already went out, only the status,
+  // resolution price and the virtual win/loss counters are fixed.
+  private reconcileClosedSignal(signal: TrackedSignal, trade: Mt5Trade): void {
+    const realOutcome = trade.outcome;
+    const realLoss = realOutcome === 'SL_HIT' && trade.pnl < 0;
+    const realScratch = realOutcome === 'BREAKEVEN_HIT' && Math.abs(trade.pnl) < 0.01;
+    const claimedTp = signal.status === 'TP_HIT';
+    const claimedBreakeven = signal.status === 'BREAKEVEN_HIT';
+    if (!claimedTp && !claimedBreakeven) return;
+    if (realLoss) {
+      if (signal.status === 'TP_HIT') this.stats.tp = Math.max(0, this.stats.tp - 1);
+      else this.stats.breakeven = Math.max(0, this.stats.breakeven - 1);
+      this.stats.sl += 1;
+      const resolvedAt = trade.closedAt ?? signal.resolvedAt ?? Date.now();
+      signal.status = 'SL_HIT';
+      signal.verdict = verdictFor('SL_HIT');
+      signal.resolutionPrice = trade.exitPrice ?? signal.resolutionPrice;
+      signal.resolvedAt = resolvedAt;
+      signal.resolvedAtUtc = isoUtc(resolvedAt);
+      signal.livePrice = signal.resolutionPrice;
+      signal.liveUpdatedAt = resolvedAt;
+      this.persistOpenSignals();
+      return;
+    }
+    if (realScratch && claimedTp) {
+      this.stats.tp = Math.max(0, this.stats.tp - 1);
+      this.stats.breakeven += 1;
+      const resolvedAt = trade.closedAt ?? signal.resolvedAt ?? Date.now();
+      signal.status = 'BREAKEVEN_HIT';
+      signal.verdict = verdictFor('BREAKEVEN_HIT');
+      signal.resolutionPrice = trade.exitPrice ?? signal.resolutionPrice;
+      signal.resolvedAt = resolvedAt;
+      signal.resolvedAtUtc = isoUtc(resolvedAt);
+      signal.livePrice = signal.resolutionPrice;
+      signal.liveUpdatedAt = resolvedAt;
+      this.persistOpenSignals();
+    }
   }
 
   private async runScanLoop(): Promise<void> {

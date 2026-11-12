@@ -8,7 +8,9 @@
  *   mirror the channel in a Telegram-style preview page.
  */
 
-import { ProxyAgent, fetch as undiciFetch } from 'undici';
+import { Agent, ProxyAgent, fetch as undiciFetch } from 'undici';
+import type { Dispatcher } from 'undici';
+import { socksDispatcher } from 'fetch-socks';
 import fs from 'fs';
 import path from 'path';
 import type {
@@ -29,7 +31,8 @@ function apiBase(): string {
 const FEED_DIR = path.join(process.cwd(), 'data');
 const FEED_FILE = path.join(FEED_DIR, 'telegram-feed.json');
 
-let proxyDispatcher: ProxyAgent | undefined;
+let proxyDispatcher: Dispatcher | undefined;
+let proxyDispatcherUrl: string | undefined;
 
 function proxyUrl(): string | undefined {
   return (
@@ -42,13 +45,34 @@ function proxyUrl(): string | undefined {
   );
 }
 
-function dispatcher(): ProxyAgent | undefined {
+// Tor and most local bridge tools expose SOCKS4/5 proxies, while
+// undici's ProxyAgent only speaks HTTP CONNECT — so a socks5:// URL
+// must be routed through a SOCKS-aware dispatcher or every send fails.
+function isSocksProxyUrl(url: URL): boolean {
+  return /^socks4a?$|^socks5h?$/i.test(url.protocol.replace(':', ''));
+}
+
+function socksProxyOptions(url: URL): Parameters<typeof socksDispatcher>[0] {
+  const isV4 = /^socks4a?$/i.test(url.protocol.replace(':', ''));
+  return {
+    type: isV4 ? 4 : 5,
+    host: url.hostname,
+    port: url.port ? Number(url.port) : 1080,
+    userId: url.username ? decodeURIComponent(url.username) : undefined,
+    password: url.password ? decodeURIComponent(url.password) : undefined,
+  };
+}
+
+function dispatcher(): Dispatcher | undefined {
   const url = proxyUrl();
   if (!url) return undefined;
-  if (!proxyDispatcher || (proxyDispatcher as unknown as { proxy?: URL }).proxy?.href !== url) {
-    proxyDispatcher?.close().catch(() => {});
-    proxyDispatcher = new ProxyAgent(url);
-  }
+  if (proxyDispatcher && proxyDispatcherUrl === url) return proxyDispatcher;
+  proxyDispatcher?.close().catch(() => {});
+  proxyDispatcherUrl = url;
+  const parsed = new URL(url);
+  proxyDispatcher = isSocksProxyUrl(parsed)
+    ? socksDispatcher(socksProxyOptions(parsed))
+    : new ProxyAgent(url);
   return proxyDispatcher;
 }
 
