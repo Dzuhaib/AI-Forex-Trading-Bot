@@ -2,14 +2,16 @@ import React, { useEffect, useState } from 'react';
 import { Speech, Volume2, VolumeX } from 'lucide-react';
 import { LiveSignalsViewer } from './components/LiveSignalsViewer';
 import { TradesViewer } from './components/TradesViewer';
+import { TelegramFeed } from './components/TelegramFeed';
 import { VoiceAnnouncer } from './components/VoiceAnnouncer';
 import { announce, isVoiceEnabled, setVoiceEnabled, subscribeVoice } from './lib/voiceState';
 
-type Tab = 'LIVE_SIGNALS' | 'TRADES';
+type Tab = 'LIVE_SIGNALS' | 'TRADES' | 'TELEGRAM';
 
 const NAV_ITEMS: Array<{ tab: Tab; label: string }> = [
   { tab: 'LIVE_SIGNALS', label: 'Live Signals' },
   { tab: 'TRADES', label: 'Trades' },
+  { tab: 'TELEGRAM', label: 'Telegram' },
 ];
 
 export default function App() {
@@ -81,7 +83,13 @@ export default function App() {
       </header>
 
       <main className="mx-auto w-full max-w-[1200px] flex-1 px-4 py-6 sm:px-8 sm:py-8">
-        {activeTab === 'LIVE_SIGNALS' ? <LiveSignalsViewer /> : <TradesViewer />}
+        {activeTab === 'LIVE_SIGNALS' ? (
+          <LiveSignalsViewer />
+        ) : activeTab === 'TRADES' ? (
+          <TradesViewer />
+        ) : (
+          <TelegramFeed />
+        )}
       </main>
       <VoiceAnnouncer />
 

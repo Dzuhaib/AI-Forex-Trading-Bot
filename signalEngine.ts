@@ -3,7 +3,7 @@
  * - Scans FX/CFD instruments (gold, WTI, majors, BTC) on OANDA data.
  * - Sizes each trade from the connected MT5 account balance (5% risk, per-pair SL, 2R TP).
  * - Watches every open signal against live M1 and S5 candles.
- * - At 50% of TP, moves SL to a 20% TP profit lock and trails it 30% of TP behind the best price.
+ * - At 70% of TP, moves SL to a 50% TP profit lock (1R) and trails it 30% of TP behind the best price.
  * - Executes entries, exits and trailing stops on the logged-in MT5 account.
  * - Dashboard pair selections and the MT5 suffix are persisted across restarts.
  */
@@ -13,6 +13,7 @@ import type {
   LiveSignal,
   MarketTicker,
   NearZone,
+  Mt5Position,
   Mt5Status,
   PairMutationResult,
   PairsResponse,
@@ -20,13 +21,21 @@ import type {
   SignalEngineStatus,
   SignalsResponse,
   SignalStatus,
+  TelegramFeedResponse,
 } from './src/types';
 import type { Mt5Broker, Mt5SymbolInfo } from './mt5Broker';
+import { MT5_POSITION_MAGIC } from './mt5Broker';
 import type { DashboardState } from './dashboardState';
+import { TelegramNotifier } from './telegramNotifier';
+import fs from 'fs';
+import path from 'path';
 
 type Timeframe = 'H1' | 'M30';
 type ZoneType = 'DEMAND' | 'SUPPLY';
 type Interval = 'M1' | 'M30' | 'H1' | 'S5';
+
+const OPEN_SIGNALS_DIR = path.join(process.cwd(), 'data');
+const OPEN_SIGNALS_FILE = path.join(OPEN_SIGNALS_DIR, 'open-signals.json');
 
 interface Kline {
   openTime: number;
@@ -114,6 +123,7 @@ interface EngineOptions {
   oandaHost: string;
   oandaApiKey: string;
   mt5Broker: Mt5Broker | null;
+  notifier: TelegramNotifier | null;
 }
 
 // Supported pairs. Active pairs are managed from the dashboard at runtime.
@@ -626,7 +636,7 @@ const STOP_LOSS_DISTANCE: Record<string, number> = {
   DE10YB: 0.3,
 };
 const BREAKEVEN_TRIGGER_PCT = 70;
-const BREAKEVEN_LOCK_PCT = 0;
+const BREAKEVEN_LOCK_PCT = 50;
 const TRAILING_GAP_PCT = 30;
 
 function clampRiskPercent(value: unknown): number {
@@ -1141,6 +1151,8 @@ export class SignalEngine {
   private mt5BrokerSymbolScores = new Map<string, number>();
   private persistedSuffix: string;
   private riskPercent: number;
+  private restoredExecutionSynced = true;
+  private adoptionAttempted = new Set<number>();
 
   constructor(options: EngineOptions) {
     this.opts = options;
@@ -1171,6 +1183,7 @@ export class SignalEngine {
   }
 
   private async bootstrap(): Promise<void> {
+    this.restoreOpenSignals();
     await this.ensurePairsLoaded();
     if (!this.running) return;
     void this.runScanLoop();
@@ -1194,6 +1207,7 @@ export class SignalEngine {
     this.signalIdByTicket.clear();
     this.lastExecutionError = null;
     this.lastTriggerBySymbol.clear();
+    this.restoredExecutionSynced = true;
     this.stats = {
       total: 0,
       tp: 0,
@@ -1203,6 +1217,252 @@ export class SignalEngine {
       expired: 0,
     };
     this.refreshSymbols();
+    this.persistOpenSignals();
+  }
+
+  private restoreOpenSignals(): void {
+    let payload: { signals?: unknown; executions?: unknown } = {};
+    try {
+      payload = JSON.parse(fs.readFileSync(OPEN_SIGNALS_FILE, 'utf8')) as typeof payload;
+    } catch {
+      return;
+    }
+    if (!Array.isArray(payload.signals)) return;
+    const now = Date.now();
+    const maxTrackMs = this.opts.maxTrackHours * 3_600_000;
+    let restored = 0;
+    for (const item of payload.signals) {
+      const signal = item as TrackedSignal;
+      if (
+        !signal ||
+        typeof signal.id !== 'string' ||
+        typeof signal.symbol !== 'string' ||
+        signal.status !== 'OPEN' ||
+        typeof signal.entry !== 'number' ||
+        !(signal.entry > 0) ||
+        typeof signal.signalTime !== 'number'
+      ) {
+        continue;
+      }
+      if (now >= signal.signalTime + maxTrackMs + 60_000) continue;
+      const tracked: TrackedSignal = {
+        ...signal,
+        intraDone: true,
+        nextCandleOpen: Math.floor(now / 60_000) * 60_000,
+        liveUpdatedAt: now,
+      };
+      if (!Number.isFinite(tracked.bestPrice) || tracked.bestPrice <= 0) {
+        tracked.bestPrice = tracked.entry;
+      }
+      this.signals.set(tracked.id, tracked);
+      this.lastTriggerBySymbol.set(tracked.symbol, tracked.triggerCandleOpen);
+      restored += 1;
+    }
+    if (Array.isArray(payload.executions)) {
+      for (const item of payload.executions) {
+        const execution = item as SignalExecution;
+        if (
+          !execution ||
+          typeof execution.signalId !== 'string' ||
+          !this.signals.has(execution.signalId) ||
+          typeof execution.symbol !== 'string'
+        ) {
+          continue;
+        }
+        if (typeof execution.ticket === 'number' && execution.ticket > 0) {
+          this.signalIdByTicket.set(execution.ticket, execution.signalId);
+        }
+        this.executions.set(execution.signalId, {
+          ...execution,
+          closeRequested: false,
+          closing: false,
+        });
+      }
+    }
+    this.stats.total += restored;
+    this.restoredExecutionSynced = this.executions.size === 0;
+    if (restored > 0 || this.executions.size > 0) {
+      console.log(
+        `Restored ${restored} open signal(s) from the previous session; tracking resumes.`
+      );
+      this.persistOpenSignals();
+    }
+  }
+
+  private reconcileRestoredExecutions(): void {
+    const broker = this.opts.mt5Broker;
+    if (!broker?.isConnected()) return;
+    const positions = broker.getStatus().positions;
+    if (!this.restoredExecutionSynced && this.executions.size > 0) {
+      const byTicket = new Map(positions.map((position) => [position.ticket, position]));
+      let allMatched = true;
+      let changed = false;
+      for (const [signalId, execution] of this.executions.entries()) {
+        const signal = this.signals.get(signalId);
+        if (!signal) {
+          this.executions.delete(signalId);
+          continue;
+        }
+        if (execution.ticket === null) {
+          // Entry was never confirmed; do not re-execute a possibly filled order.
+          continue;
+        }
+        const position = byTicket.get(execution.ticket);
+        if (!position) {
+          // Position may have closed while the server was down; the candle
+          // replay resolves the signal and clears the execution.
+          allMatched = false;
+          continue;
+        }
+        const stopLoss = position.sl - execution.offset;
+        if (Number.isFinite(stopLoss) && stopLoss > 0) {
+          const breakevenStop =
+            signal.direction === 'LONG'
+              ? stopLoss >= signal.entry
+              : stopLoss <= signal.entry;
+          if (breakevenStop && !signal.breakevenActive) {
+            signal.breakevenActive = true;
+            changed = true;
+          }
+          const tighter =
+            signal.direction === 'LONG'
+              ? stopLoss > signal.stopLoss
+              : stopLoss < signal.stopLoss;
+          if (tighter) {
+            signal.stopLoss = stopLoss;
+            changed = true;
+          }
+        }
+      }
+      if (allMatched) this.restoredExecutionSynced = true;
+      if (changed) this.persistOpenSignals();
+    }
+    this.adoptOrphanedPositions(positions);
+  }
+
+  private adoptOrphanedPositions(positions: Mt5Position[]): void {
+    for (const position of positions) {
+      if (position.magic !== MT5_POSITION_MAGIC) continue;
+      if (this.signalIdByTicket.has(position.ticket)) continue;
+      if (this.adoptionAttempted.has(position.ticket)) continue;
+      this.adoptionAttempted.add(position.ticket);
+
+      const entry = position.priceOpen;
+      if (!(entry > 0)) continue;
+      const base = normalizePairSymbol(position.symbol);
+      if (!base) {
+        console.log(
+          `Skipping adoption of MT5 position #${position.ticket} (${position.symbol}): unknown pair.`
+        );
+        continue;
+      }
+
+      const direction: SignalDirection = position.type === 'BUY' ? 'LONG' : 'SHORT';
+      // Never adopt into a pair that already has an open tracked signal —
+      // mirrors the duplicate guard used when creating new signals.
+      let duplicate = false;
+      for (const signal of this.signals.values()) {
+        if (signal.status === 'OPEN' && signal.symbol === base) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (duplicate) {
+        console.log(
+          `Skipping adoption of MT5 position #${position.ticket} (${base} ${direction}): an open signal already tracks this pair.`
+        );
+        continue;
+      }
+      const stopLoss = position.sl > 0 ? position.sl : 0;
+      const takeProfit = position.tp > 0 ? position.tp : 0;
+      const targets = this.riskTargets(base);
+      const initialRiskDistance = Math.abs(entry - stopLoss) || targets?.slDistance || 0;
+      if (!(initialRiskDistance > 0) || !(takeProfit > 0)) continue;
+
+      const now = Date.now();
+      const signalTime = position.time > 1e12 ? position.time : position.time * 1000;
+      const breakevenStop =
+        stopLoss > 0 &&
+        (direction === 'LONG' ? stopLoss >= entry : stopLoss <= entry);
+      const tracked: TrackedSignal = {
+        id: `adopt_${position.ticket}`,
+        symbol: base,
+        direction,
+        status: 'OPEN',
+        verdict: verdictFor('OPEN'),
+        timeframe: 'H1',
+        bodyTop: entry,
+        bodyBottom: entry,
+        htfVolRatio: 0,
+        m1VolRatio: 0,
+        entry,
+        stopLoss,
+        takeProfit,
+        initialRiskDistance,
+        riskPct: 0,
+        rewardPct: 0,
+        roePct: 0,
+        leverage: 0,
+        signalTime,
+        signalTimeUtc: isoUtc(signalTime),
+        resolvedAt: null,
+        resolvedAtUtc: null,
+        resolutionPrice: null,
+        holdMinutes: null,
+        mfeR: 0,
+        maeR: 0,
+        livePrice: position.priceCurrent > 0 ? position.priceCurrent : entry,
+        liveUpdatedAt: now,
+        priceChangePct: 0,
+        unrealizedR: 0,
+        progressPct: 0,
+        distanceToTpPct: 0,
+        distanceToSlPct: 0,
+        reason: 'Adopted from an open MT5 position after restart.',
+        triggerCandleOpen: signalTime,
+        signalMinuteEnd: now,
+        nextCandleOpen: Math.floor(now / 60_000) * 60_000,
+        intraDone: true,
+        bestPrice: entry,
+        breakevenActive: breakevenStop,
+      };
+      this.signals.set(tracked.id, tracked);
+      this.lastTriggerBySymbol.set(base, tracked.triggerCandleOpen);
+      this.signalIdByTicket.set(position.ticket, tracked.id);
+      this.executions.set(tracked.id, {
+        signalId: tracked.id,
+        symbol: base,
+        volume: position.volume,
+        offset: 0,
+        ticket: position.ticket,
+        closeRequested: false,
+        closing: false,
+        error: null,
+      });
+      this.stats.total += 1;
+      console.log(
+        `Adopted open MT5 position #${position.ticket} (${base} ${direction}); breakeven tracking resumes.`
+      );
+      this.persistOpenSignals();
+    }
+  }
+
+  private persistOpenSignals(): void {
+    try {
+      fs.mkdirSync(OPEN_SIGNALS_DIR, { recursive: true });
+      const payload = {
+        savedAt: Date.now(),
+        signals: [...this.signals.values()].filter((signal) => signal.status === 'OPEN'),
+        executions: [...this.executions.values()],
+      };
+      fs.writeFileSync(
+        OPEN_SIGNALS_FILE,
+        `${JSON.stringify(payload, null, 2)}\n`,
+        'utf8'
+      );
+    } catch {
+      // Persistence is best-effort; the engine keeps running without it.
+    }
   }
 
   private riskBase(): number {
@@ -1312,6 +1572,15 @@ export class SignalEngine {
     };
   }
 
+  async telegramFeed(): Promise<TelegramFeedResponse> {
+    const notifier = this.opts.notifier;
+    if (!notifier) {
+      return { enabled: false, chatId: '', chatTitle: null, messages: [] };
+    }
+    await notifier.ensureChatTitle();
+    return notifier.getFeed();
+  }
+
   getResponse(): SignalsResponse {
     const now = Date.now();
     const all = [...this.signals.values()];
@@ -1389,7 +1658,12 @@ export class SignalEngine {
         signal.status === 'SL_HIT' ||
         signal.status === 'BREAKEVEN_HIT'
       ) {
-        trade.outcome = signal.status;
+        // A real loss can never be a breakeven or a TP. If the virtual stop
+        // drifted from the actual broker stop (failed modify), the executed
+        // deal outcome wins.
+        if (!(trade.outcome === 'SL_HIT' && signal.status !== 'SL_HIT')) {
+          trade.outcome = signal.status;
+        }
       }
       if (!trade.stopLoss) trade.stopLoss = signal.stopLoss + offset;
       if (!trade.takeProfit) trade.takeProfit = signal.takeProfit + offset;
@@ -1494,6 +1768,8 @@ export class SignalEngine {
       if (price === undefined) continue;
       signal.livePrice = price;
       signal.liveUpdatedAt = now;
+      this.extendBestPrice(signal, price);
+      this.advanceTrailingStop(signal);
     }
     if (!this.targetsSynced) {
       this.targetsSynced = true;
@@ -2070,8 +2346,10 @@ export class SignalEngine {
     this.lastTriggerBySymbol.set(signal.symbol, signal.triggerCandleOpen);
     this.signals.set(tracked.id, tracked);
     this.stats.total += 1;
+    this.opts.notifier?.newSignal(tracked);
     this.openMt5Execution(tracked);
     this.trimResolvedHistory();
+    this.persistOpenSignals();
   }
 
   private openMt5Execution(signal: TrackedSignal): void {
@@ -2157,6 +2435,7 @@ export class SignalEngine {
       this.signalIdByTicket.set(result.ticket, signal.id);
       this.lastExecutionError = null;
       this.lastError = null;
+      this.persistOpenSignals();
       if (execution.closeRequested) this.tryCloseExecution(execution);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'MT5 entry failed.';
@@ -2164,6 +2443,7 @@ export class SignalEngine {
       this.lastExecutionError = `MT5 ${signal.symbol} entry: ${message}`;
       this.lastError = this.lastExecutionError;
       this.executions.delete(execution.signalId);
+      this.persistOpenSignals();
     }
   }
 
@@ -2179,6 +2459,7 @@ export class SignalEngine {
       this.executions.delete(execution.signalId);
       this.lastError = result.closed ? null : (result.message ?? null);
       this.trimResolvedHistory();
+      this.persistOpenSignals();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'MT5 close failed.';
       execution.error = message;
@@ -2225,6 +2506,7 @@ export class SignalEngine {
 
   private async watchOnce(): Promise<void> {
     if (this.watching || !this.running) return;
+    this.reconcileRestoredExecutions();
     this.flushPendingExecutions();
     const groups = new Map<string, TrackedSignal[]>();
     for (const signal of this.signals.values()) {
@@ -2400,10 +2682,21 @@ export class SignalEngine {
     if (!(tpDistance > 0)) return;
 
     const favourablePrice = signal.direction === 'LONG' ? candle.high : candle.low;
+    this.extendBestPrice(signal, favourablePrice);
+    this.advanceTrailingStop(signal);
+  }
+
+  private extendBestPrice(signal: TrackedSignal, price: number): void {
     signal.bestPrice =
       signal.direction === 'LONG'
-        ? Math.max(signal.bestPrice, favourablePrice)
-        : Math.min(signal.bestPrice, favourablePrice);
+        ? Math.max(signal.bestPrice, price)
+        : Math.min(signal.bestPrice, price);
+  }
+
+  private advanceTrailingStop(signal: TrackedSignal): void {
+    if (signal.status !== 'OPEN') return;
+    const tpDistance = Math.abs(signal.takeProfit - signal.entry);
+    if (!(tpDistance > 0)) return;
 
     const progress = Math.abs(signal.bestPrice - signal.entry);
     if (!signal.breakevenActive && progress < tpDistance * (BREAKEVEN_TRIGGER_PCT / 100)) {
@@ -2416,15 +2709,24 @@ export class SignalEngine {
         ? Math.max(signal.stopLoss, candidate)
         : Math.min(signal.stopLoss, candidate);
 
-    if (!signal.breakevenActive) {
+    const firstBreakeven = !signal.breakevenActive;
+    if (firstBreakeven) {
       signal.breakevenActive = true;
     }
+    let stopChanged = false;
     if (nextStop !== signal.stopLoss) {
       signal.stopLoss = nextStop;
+      stopChanged = true;
       const execution = this.executions.get(signal.id);
       if (execution && execution.ticket !== null) {
         this.enqueueBroker(() => this.executeMt5Modify(signal, execution));
       }
+    }
+    if (firstBreakeven) {
+      this.opts.notifier?.breakeven(signal);
+      this.persistOpenSignals();
+    } else if (stopChanged) {
+      this.persistOpenSignals();
     }
   }
 
@@ -2496,7 +2798,9 @@ export class SignalEngine {
     else if (status === 'BREAKEVEN_HIT') this.stats.breakeven += 1;
     else if (status === 'AMBIGUOUS') this.stats.ambiguous += 1;
     else if (status === 'EXPIRED') this.stats.expired += 1;
+    this.opts.notifier?.resolution(signal);
     this.trimResolvedHistory();
+    this.persistOpenSignals();
   }
 
   private toPublicSignal(signal: TrackedSignal, now: number): LiveSignal {
@@ -2577,6 +2881,13 @@ export function createSignalEngineFromEnv(
       : 'https://api-fxpractice.oanda.com';
   const oandaApiKey = (process.env.OANDA_API_KEY ?? '').trim();
 
+  const telegramToken = (process.env.TELEGRAM_BOT_TOKEN ?? '').trim();
+  const telegramChatId = (process.env.TELEGRAM_CHAT_ID ?? '').trim();
+  const notifier =
+    telegramToken && telegramChatId
+      ? new TelegramNotifier(telegramToken, telegramChatId)
+      : null;
+
   return new SignalEngine({
     enabled: envFlag('SIGNAL_ENGINE_ENABLED', true),
     scanIntervalMs: envNumber('SIGNAL_SCAN_INTERVAL_MS', 25_000),
@@ -2595,5 +2906,6 @@ export function createSignalEngineFromEnv(
     oandaHost,
     oandaApiKey,
     mt5Broker,
+    notifier,
   });
 }

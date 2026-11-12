@@ -18,6 +18,9 @@ import type {
   SignalStatus,
 } from './src/types';
 
+// Must stay in sync with MAGIC in mt5_bridge.py — identifies positions opened by this bot.
+export const MT5_POSITION_MAGIC = 20261030;
+
 type BridgeResponse = {
   id: number;
   ok: boolean;
@@ -171,6 +174,15 @@ export type Mt5OrderResult = {
   price: number;
   retcode: number;
   comment: string;
+};
+
+export type Mt5PairTpSlStats = {
+  symbol: string;
+  tp: number;
+  sl: number;
+  breakeven: number;
+  expired: number;
+  total: number;
 };
 
 export type Mt5MutationResult = {
@@ -367,6 +379,31 @@ export class Mt5Broker {
     };
 
     return { account, trades };
+  }
+
+  getPairTpSlStats(): Mt5PairTpSlStats[] {
+    const openTickets = new Set(this.status.positions.map((position) => position.ticket));
+    const closedTrades = this.getClosedTrades(openTickets).closedTrades;
+    const bySymbol = new Map<string, Mt5PairTpSlStats>();
+    for (const trade of closedTrades) {
+      const entry = bySymbol.get(trade.symbol) ?? {
+        symbol: trade.symbol,
+        tp: 0,
+        sl: 0,
+        breakeven: 0,
+        expired: 0,
+        total: 0,
+      };
+      entry.total += 1;
+      if (trade.outcome === 'TP_HIT') entry.tp += 1;
+      else if (trade.outcome === 'SL_HIT') entry.sl += 1;
+      else if (trade.outcome === 'BREAKEVEN_HIT') entry.breakeven += 1;
+      else if (trade.outcome === 'EXPIRED') entry.expired += 1;
+      bySymbol.set(trade.symbol, entry);
+    }
+    return [...bySymbol.values()].sort(
+      (a, b) => b.total - a.total || a.symbol.localeCompare(b.symbol)
+    );
   }
 
   private currentLogin(): number | null {

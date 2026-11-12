@@ -1,6 +1,8 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
+import { spawn } from 'child_process';
+import net from 'net';
 import dotenv from 'dotenv';
 import { createSignalEngineFromEnv } from './signalEngine';
 import { Mt5Broker } from './mt5Broker';
@@ -13,6 +15,35 @@ import {
 } from './geminiVoice';
 
 dotenv.config();
+
+function ensureTorRunning(): void {
+  const proxy = (process.env.TELEGRAM_PROXY_URL ?? '').trim();
+  if (!proxy.includes('127.0.0.1:9050')) return;
+  const probe = net.connect(9050, '127.0.0.1');
+  probe.once('connect', () => {
+    probe.destroy();
+    console.log('Tor SOCKS proxy already running on 127.0.0.1:9050.');
+  });
+  probe.once('error', () => {
+    probe.destroy();
+    const torExe = path.resolve('tor', 'tor', 'tor.exe');
+    const torrc = path.resolve('tor', 'torrc');
+    try {
+      const child = spawn(torExe, ['-f', torrc], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.unref();
+      child.on('error', (error) => console.error(`Failed to start Tor: ${error.message}`));
+      console.log('Starting Tor SOCKS proxy on 127.0.0.1:9050 (ready in 1-3 minutes)...');
+    } catch (error) {
+      console.error('Failed to start Tor:', error);
+    }
+  });
+}
+
+ensureTorRunning();
 
 const MUTATION_LIMIT = 30;
 const MUTATION_WINDOW_MS = 60_000;
@@ -114,6 +145,15 @@ async function startServer() {
   app.get('/api/signals', (_req, res) => {
     res.set('Cache-Control', 'no-store');
     res.json(signalEngine.getResponse());
+  });
+
+  app.get('/api/telegram/feed', async (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    try {
+      res.json(await signalEngine.telegramFeed());
+    } catch {
+      res.status(500).json({ error: 'Fetching the Telegram feed failed.' });
+    }
   });
 
   app.post('/api/signals/scan', (_req, res) => {

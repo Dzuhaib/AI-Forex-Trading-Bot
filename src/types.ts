@@ -247,3 +247,40 @@ export interface SignalsResponse {
   trades: Mt5Trade[];
   mt5: Mt5Status;
 }
+
+export interface TelegramSignalInfo {
+  symbol: string;
+  direction: SignalDirection;
+  status: SignalStatus;
+  timeframe: string;
+  entry: number;
+  stopLoss: number;
+  takeProfit: number;
+  initialRiskDistance: number;
+  signalTimeUtc: string;
+  htfVolRatio: number;
+  m1VolRatio: number;
+  reason: string;
+  holdMinutes?: number | null;
+  resolutionPrice?: number | null;
+  resolvedAtUtc?: string | null;
+  resultR?: number | null;
+}
+
+export type TelegramMessageKind = 'SIGNAL' | 'BREAKEVEN' | 'RESULT';
+
+export interface TelegramFeedMessage {
+  id: string;
+  kind: TelegramMessageKind;
+  status: 'SENT' | 'FAILED';
+  postedAt: number | null;
+  text: string;
+  signal: TelegramSignalInfo | null;
+}
+
+export interface TelegramFeedResponse {
+  enabled: boolean;
+  chatId: string;
+  chatTitle: string | null;
+  messages: TelegramFeedMessage[];
+}
