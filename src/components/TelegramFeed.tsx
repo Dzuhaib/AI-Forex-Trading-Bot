@@ -166,12 +166,13 @@ function MessageBubble({
         {message.kind === 'BREAKEVEN' && signal && (
           <>
             <div className="mb-1 text-[15px] font-semibold text-[#c2a5ff]">
-              🔒 BREAKEVEN ACTIVATED
+              🔒 1R REACHED — 50% BOOKED
             </div>
             <div className="text-[15px] font-bold text-[#f5f5f5]">
               📊 Pair: {signal.symbol}
             </div>
-            <div className="mt-1 text-[14px] text-[#f5f5f5]">🛡️ Stop Loss moved to 50% profit lock (1R).</div>
+            <div className="mt-1 text-[14px] text-[#f5f5f5]">💰 Booked 50% of the position at 1R.</div>
+            <div className="mt-0.5 text-[14px] text-[#f5f5f5]">🛑 Stop Loss moved to entry (breakeven).</div>
             {signal.stopLoss !== null && signal.stopLoss !== undefined && (
               <div className="mt-0.5 text-[14px] text-[#f5f5f5]">
                 🛑 New Stop Loss: <code className="font-mono">{formatPrice(signal.stopLoss)}</code>
@@ -227,9 +228,12 @@ function MessageBubble({
 
         <div className="mt-1 flex items-center justify-end gap-1.5">
           {failed ? (
-            <span className="flex items-center gap-1 text-[11px] text-[#ff8b80]">
+            <span
+              className="flex items-center gap-1 text-[11px] text-[#ff8b80]"
+              title={message.error ?? undefined}
+            >
               <TriangleAlert className="h-3 w-3" />
-              not delivered
+              not delivered{message.error ? `: ${message.error}` : ''}
             </span>
           ) : (
             <>

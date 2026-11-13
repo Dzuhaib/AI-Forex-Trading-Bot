@@ -265,6 +265,8 @@ export interface TelegramSignalInfo {
   resolutionPrice?: number | null;
   resolvedAtUtc?: string | null;
   resultR?: number | null;
+  /** True when half the position was already booked at the 1R trigger. */
+  partialBooked?: boolean;
 }
 
 export type TelegramMessageKind = 'SIGNAL' | 'BREAKEVEN' | 'RESULT';
@@ -276,6 +278,8 @@ export interface TelegramFeedMessage {
   postedAt: number | null;
   text: string;
   signal: TelegramSignalInfo | null;
+  /** Set when delivery failed, with the last error the notifier saw. */
+  error?: string | null;
 }
 
 export interface TelegramFeedResponse {

@@ -450,10 +450,17 @@ def _close_position(payload: dict) -> dict:
         raise RuntimeError(f"MT5 quote unavailable for {position.symbol}.")
 
     is_buy = int(position.type) == mt5.POSITION_TYPE_BUY
+    requested_volume = payload.get("volume")
+    if requested_volume:
+        volume = _volume_for_symbol(symbol_info, float(requested_volume))
+        if volume > float(position.volume) + 1e-9:
+            volume = float(position.volume)
+    else:
+        volume = float(position.volume)
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": position.symbol,
-        "volume": float(position.volume),
+        "volume": volume,
         "type": mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
         "position": ticket,
         "price": float(tick["bid"] if is_buy else tick["ask"]),

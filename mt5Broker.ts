@@ -226,7 +226,7 @@ const HISTORY_TTL_MS = 30_000;
 const DAILY_PNL_DAYS = 30;
 const SYNC_FAILURE_LIMIT = 3;
 const RECONNECT_DELAY_MS = 15_000;
-const MT5_RISK_PERCENT = 5;
+const MT5_RISK_PERCENT = 3;
 const DEAL_REASON_SL = 4;
 const DEAL_REASON_TP = 5;
 const DEAL_REASON_STOPOUT = 6;
@@ -851,13 +851,18 @@ export class Mt5Broker {
     return data;
   }
 
-  async closePosition(ticket: number): Promise<{ closed: boolean; ticket: number; price?: number; message?: string }> {
+  async closePosition(
+    ticket: number,
+    volume?: number
+  ): Promise<{ closed: boolean; ticket: number; price?: number; message?: string }> {
     if (!this.isConnected() || !this.bridge) {
       throw new Error('MT5 is not connected.');
     }
+    const payload: Record<string, unknown> = { ticket };
+    if (volume && volume > 0) payload.volume = volume;
     const result = await this.bridge.request<{ closed: boolean; ticket: number; price?: number; message?: string }>(
       'close',
-      { ticket },
+      payload,
       60_000
     );
     void this.sync();

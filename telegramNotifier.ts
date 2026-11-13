@@ -28,6 +28,18 @@ const FEED_LIMIT = 200;
 function apiBase(): string {
   return (process.env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\/+$/, '');
 }
+
+/**
+ * Optional GET relay for networks where api.telegram.org is blocked.
+ * Set TELEGRAM_RELAY_URL to a template containing {URL}, e.g.:
+ *   TELEGRAM_RELAY_URL=https://r.jina.ai/{URL}
+ * The bot swaps in the encoded Telegram call and reads the JSON out of the
+ * relayed response. Takes precedence over a direct call when set.
+ */
+function relayTemplate(): string | undefined {
+  const raw = (process.env.TELEGRAM_RELAY_URL || '').trim();
+  return raw.includes('{URL}') ? raw : undefined;
+}
 const FEED_DIR = path.join(process.cwd(), 'data');
 const FEED_FILE = path.join(FEED_DIR, 'telegram-feed.json');
 
@@ -122,7 +134,10 @@ function resultR(info: TelegramSignalInfo): number | null {
   const price = info.resolutionPrice;
   if (!(risk > 0) || price === null || price === undefined) return null;
   const move = info.direction === 'LONG' ? price - info.entry : info.entry - price;
-  return move / risk;
+  const exitR = move / risk;
+  // With the 1R rule, half the position was booked at 1R, so the reported
+  // result blends the booked half (1R) with the final exit of the other half.
+  return info.partialBooked ? 0.5 + exitR / 2 : exitR;
 }
 
 function formatNewSignal(info: TelegramSignalInfo): string {
@@ -146,10 +161,11 @@ function formatNewSignal(info: TelegramSignalInfo): string {
 
 function formatBreakeven(info: TelegramSignalInfo): string {
   return [
-    '🔒 <b>BREAKEVEN ACTIVATED</b>',
+    '🔒 <b>1R REACHED — 50% BOOKED</b>',
     '',
     `📊 Pair: <b>${escapeHtml(info.symbol)}</b>`,
-    '🛡️ Stop Loss moved to 50% profit lock (1R).',
+    '💰 Booked 50% of the position at 1R.',
+    '🛑 Stop Loss moved to entry (breakeven).',
     `🛑 New Stop Loss: <code>${formatPrice(info.stopLoss)}</code>`,
     '',
     `<i>${escapeHtml(BREAKEVEN_QUOTE)}</i>`,
@@ -236,15 +252,9 @@ export class TelegramNotifier {
     if (!this.enabled || this.chatTitleFetched) return;
     this.chatTitleFetched = true;
     try {
-      const response = await undiciFetch(
-        `${apiBase()}/bot${this.token}/getChat?chat_id=${encodeURIComponent(this.chatId)}`,
-        { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS), dispatcher: dispatcher() }
-      );
-      if (!response.ok) return;
-      const body = (await response.json()) as {
-        ok: boolean;
-        result?: { title?: string; username?: string };
-      };
+      const body = (await this.request('getChat', {
+        chat_id: this.chatId,
+      })) as { ok?: boolean; result?: { title?: string; username?: string } };
       if (!body.ok) return;
       this.chatTitle =
         body.result?.title ?? body.result?.username ?? this.chatTitle;
@@ -293,7 +303,7 @@ export class TelegramNotifier {
         }
         this.lastError =
           error instanceof Error ? error.message : 'Telegram delivery failed.';
-        this.record(kind, text, 'FAILED', signal);
+        this.record(kind, text, 'FAILED', signal, this.lastError);
       }
     }
   }
@@ -302,7 +312,8 @@ export class TelegramNotifier {
     kind: TelegramFeedMessage['kind'],
     text: string,
     status: TelegramFeedMessage['status'],
-    signal: TelegramSignalInfo | null
+    signal: TelegramSignalInfo | null,
+    error?: string | null
   ): void {
     this.feedCounter += 1;
     this.feed.push({
@@ -312,6 +323,7 @@ export class TelegramNotifier {
       postedAt: status === 'SENT' ? Date.now() : null,
       text,
       signal,
+      error: error ?? null,
     });
     if (this.feed.length > FEED_LIMIT) {
       this.feed.splice(0, this.feed.length - FEED_LIMIT);
@@ -355,6 +367,7 @@ export class TelegramNotifier {
               : null,
           text: item.text,
           signal: (item.signal ?? null) as TelegramSignalInfo | null,
+          error: typeof item.error === 'string' ? item.error : null,
         });
       }
       this.feedCounter = maxId;
@@ -382,21 +395,45 @@ export class TelegramNotifier {
   private async request(
     method: string,
     payload: Record<string, unknown>
-  ): Promise<void> {
-    const response = await undiciFetch(`${apiBase()}/bot${this.token}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      dispatcher: dispatcher(),
-    });
+  ): Promise<Record<string, unknown>> {
+    const relay = relayTemplate();
+    const origin = apiBase();
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(payload)) {
+      params.set(key, String(value));
+    }
+    let response: Awaited<ReturnType<typeof undiciFetch>>;
+    if (relay) {
+      // Blocked network: GET the Telegram call through the relay template.
+      // The cache buster keeps identical sends from hitting relay caches.
+      const target = `${origin}/bot${this.token}/${method}?${params.toString()}&cb=${Date.now()}`;
+      response = await undiciFetch(relay.replace('{URL}', encodeURIComponent(target)), {
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS * 2),
+        dispatcher: dispatcher(),
+      });
+    } else {
+      response = await undiciFetch(`${origin}/bot${this.token}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        dispatcher: dispatcher(),
+      });
+    }
     let body: {
       ok?: boolean;
       description?: string;
       parameters?: { retry_after?: number };
     } = { ok: false };
     try {
-      body = (await response.json()) as typeof body;
+      let jsonText = await response.text();
+      if (relay) {
+        // Relays like r.jina.ai wrap the payload in markdown; pull out the JSON.
+        const start = jsonText.indexOf('{"ok"');
+        const end = jsonText.lastIndexOf('}');
+        if (start >= 0 && end > start) jsonText = jsonText.slice(start, end + 1);
+      }
+      body = JSON.parse(jsonText) as typeof body;
     } catch {
       body = { ok: false, description: `HTTP ${response.status}.` };
     }
@@ -407,6 +444,7 @@ export class TelegramNotifier {
     if (!response.ok || !body.ok) {
       throw new TelegramApiError(body.description ?? `HTTP ${response.status}.`);
     }
+    return body as Record<string, unknown>;
   }
 }
 

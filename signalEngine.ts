@@ -1,9 +1,9 @@
 ﻿/**
  * Server-side live signal engine for the Untested H1/M30 High-Volume Body + M1 Reversal strategy.
  * - Scans FX/CFD instruments (gold, WTI, majors, BTC) on OANDA data.
- * - Sizes each trade from the connected MT5 account balance (5% risk, per-pair SL, 2R TP).
+ * - Sizes each trade from the connected MT5 account balance (3% risk, per-pair SL, 2R TP).
  * - Watches every open signal against live M1 and S5 candles.
- * - At 70% of TP, moves SL to a 50% TP profit lock (1R) and trails it 30% of TP behind the best price.
+ * - At 1R profit (50% of the 2RR TP), books 50% of the MT5 position and freezes the SL at entry.
  * - Executes entries, exits and trailing stops on the logged-in MT5 account.
  * - Dashboard pair selections and the MT5 suffix are persisted across restarts.
  */
@@ -66,6 +66,8 @@ interface TrackedSignal extends LiveSignal {
   initialRiskDistance: number;
   bestPrice: number;
   breakevenActive: boolean;
+  /** True once half the MT5 position was booked at the 1R breakeven trigger. */
+  partialBooked: boolean;
 }
 
 interface SignalExecution {
@@ -76,6 +78,8 @@ interface SignalExecution {
   ticket: number | null;
   closeRequested: boolean;
   closing: boolean;
+  /** In-flight 50% partial book at the 1R trigger. */
+  booking: boolean;
   error: string | null;
 }
 
@@ -571,7 +575,9 @@ const STOP_PERCENT_BY_CATEGORY: Record<string, number> = {
 const HTF_VOL_LOOKBACK = 10;
 const HTF_VOL_MULTIPLIER = 1.5;
 const M1_VOL_LOOKBACK = 10;
-const M1_VOL_MULTIPLIER = 1.2;
+// M1 confirmation candle volume must be at least 1.5x the average volume of
+// the previous 10 M1 candles (average excludes the trigger candle itself).
+const M1_VOL_MULTIPLIER = 1.5;
 const TOUCH_TOLERANCE_PCT = 0.08;
 const HTF_CACHE_MS = 90_000;
 const MAX_RESOLVED_HISTORY = 400;
@@ -579,7 +585,7 @@ const DEFAULT_RISK_BALANCE = 100;
 const MIN_LOT_SIZE = 0.01;
 const MAX_LOT_SIZE = 100;
 const LOT_STEP = 0.01;
-const RISK_PERCENT = 5;
+const RISK_PERCENT = 3;
 const MIN_RISK_PERCENT = 0.1;
 const MAX_RISK_PERCENT = 100;
 const REWARD_RISK_RATIO = 2;
@@ -636,9 +642,7 @@ const STOP_LOSS_DISTANCE: Record<string, number> = {
   UK10YB: 0.3,
   DE10YB: 0.3,
 };
-const BREAKEVEN_TRIGGER_PCT = 70;
-const BREAKEVEN_LOCK_PCT = 50;
-const TRAILING_GAP_PCT = 30;
+const BREAKEVEN_TRIGGER_PCT = 50; // 1R reached = 50% of the 2RR TP distance
 
 function clampRiskPercent(value: unknown): number {
   const parsed = Number(value);
@@ -1255,6 +1259,10 @@ export class SignalEngine {
       if (!Number.isFinite(tracked.bestPrice) || tracked.bestPrice <= 0) {
         tracked.bestPrice = tracked.entry;
       }
+      if (typeof tracked.partialBooked !== 'boolean') {
+        // Signals saved before the 1R partial-book existed never booked.
+        tracked.partialBooked = Boolean(tracked.breakevenActive);
+      }
       this.signals.set(tracked.id, tracked);
       this.lastTriggerBySymbol.set(tracked.symbol, tracked.triggerCandleOpen);
       restored += 1;
@@ -1277,6 +1285,7 @@ export class SignalEngine {
           ...execution,
           closeRequested: false,
           closing: false,
+          booking: false,
         });
       }
     }
@@ -1426,6 +1435,7 @@ export class SignalEngine {
         intraDone: true,
         bestPrice: entry,
         breakevenActive: breakevenStop,
+        partialBooked: breakevenStop,
       };
       this.signals.set(tracked.id, tracked);
       this.lastTriggerBySymbol.set(base, tracked.triggerCandleOpen);
@@ -1438,6 +1448,7 @@ export class SignalEngine {
         ticket: position.ticket,
         closeRequested: false,
         closing: false,
+        booking: false,
         error: null,
       });
       this.stats.total += 1;
@@ -1813,7 +1824,7 @@ export class SignalEngine {
       signal.livePrice = price;
       signal.liveUpdatedAt = now;
       this.extendBestPrice(signal, price);
-      this.advanceTrailingStop(signal);
+      this.advanceBreakevenStop(signal);
     }
     if (!this.targetsSynced) {
       this.targetsSynced = true;
@@ -1829,18 +1840,18 @@ export class SignalEngine {
       const targets = this.riskTargets(signal.symbol);
       if (!targets) continue;
       signal.initialRiskDistance = targets.slDistance;
-      const initialStop =
-        signal.direction === 'LONG'
-          ? signal.entry - targets.slDistance
-          : signal.entry + targets.slDistance;
-      const trailingStop = signal.breakevenActive
-        ? this.trailingStopPrice(signal, targets.tpDistance)
-        : initialStop;
-      const activeStop = signal.breakevenActive ? signal.stopLoss : initialStop;
-      signal.stopLoss =
-        signal.direction === 'LONG'
-          ? Math.max(initialStop, activeStop, trailingStop)
-          : Math.min(initialStop, activeStop, trailingStop);
+      if (!signal.breakevenActive) {
+        const initialStop =
+          signal.direction === 'LONG'
+            ? signal.entry - targets.slDistance
+            : signal.entry + targets.slDistance;
+        // SL can only tighten, never loosen, before the breakeven triggers.
+        signal.stopLoss =
+          signal.direction === 'LONG'
+            ? Math.max(initialStop, signal.stopLoss)
+            : Math.min(initialStop, signal.stopLoss);
+      }
+      // Once breakeven is active the SL stays frozen at entry.
       signal.takeProfit =
         signal.direction === 'LONG'
           ? signal.entry + targets.tpDistance
@@ -2385,6 +2396,7 @@ export class SignalEngine {
       initialRiskDistance: Math.abs(signal.entry - signal.stopLoss),
       bestPrice: signal.entry,
       breakevenActive: false,
+      partialBooked: false,
     };
 
     this.lastTriggerBySymbol.set(signal.symbol, signal.triggerCandleOpen);
@@ -2409,6 +2421,7 @@ export class SignalEngine {
       ticket: null,
       closeRequested: false,
       closing: false,
+      booking: false,
       error: null,
     };
     this.executions.set(signal.id, execution);
@@ -2711,23 +2724,11 @@ export class SignalEngine {
     return this.isBreakevenStop(signal) ? 'BREAKEVEN_HIT' : 'SL_HIT';
   }
 
-  private trailingStopPrice(signal: TrackedSignal, tpDistance: number): number {
-    const lock = tpDistance * (BREAKEVEN_LOCK_PCT / 100);
-    const gap = tpDistance * (TRAILING_GAP_PCT / 100);
-    if (signal.direction === 'LONG') {
-      return Math.max(signal.entry + lock, signal.bestPrice - gap);
-    }
-    return Math.min(signal.entry - lock, signal.bestPrice + gap);
-  }
-
   private updateTrailingStop(signal: TrackedSignal, candle: Kline): void {
     if (signal.status !== 'OPEN') return;
-    const tpDistance = Math.abs(signal.takeProfit - signal.entry);
-    if (!(tpDistance > 0)) return;
-
     const favourablePrice = signal.direction === 'LONG' ? candle.high : candle.low;
     this.extendBestPrice(signal, favourablePrice);
-    this.advanceTrailingStop(signal);
+    this.advanceBreakevenStop(signal);
   }
 
   private extendBestPrice(signal: TrackedSignal, price: number): void {
@@ -2737,40 +2738,94 @@ export class SignalEngine {
         : Math.min(signal.bestPrice, price);
   }
 
-  private advanceTrailingStop(signal: TrackedSignal): void {
+  /** 1R trigger: books 50% of the position and freezes the SL at entry. */
+  private advanceBreakevenStop(signal: TrackedSignal): void {
     if (signal.status !== 'OPEN') return;
-    const tpDistance = Math.abs(signal.takeProfit - signal.entry);
-    if (!(tpDistance > 0)) return;
+    const execution = this.executions.get(signal.id);
 
-    const progress = Math.abs(signal.bestPrice - signal.entry);
-    if (!signal.breakevenActive && progress < tpDistance * (BREAKEVEN_TRIGGER_PCT / 100)) {
+    // Once the breakeven triggered, the SL stays frozen at entry. The only
+    // outstanding work is retrying the 50% book if it failed earlier.
+    if (signal.breakevenActive) {
+      if (
+        execution &&
+        execution.ticket !== null &&
+        !signal.partialBooked &&
+        !execution.booking &&
+        !execution.closing
+      ) {
+        execution.booking = true;
+        this.enqueueBroker(() => this.executeMt5PartialBook(signal, execution));
+      }
       return;
     }
 
-    const candidate = this.trailingStopPrice(signal, tpDistance);
-    const nextStop =
-      signal.direction === 'LONG'
-        ? Math.max(signal.stopLoss, candidate)
-        : Math.min(signal.stopLoss, candidate);
+    const tpDistance = Math.abs(signal.takeProfit - signal.entry);
+    if (!(tpDistance > 0)) return;
+    const riskDistance =
+      signal.initialRiskDistance > 0
+        ? signal.initialRiskDistance
+        : tpDistance / REWARD_RISK_RATIO;
+    const progress = Math.abs(signal.bestPrice - signal.entry);
+    if (progress < tpDistance * (BREAKEVEN_TRIGGER_PCT / 100) || progress < riskDistance) {
+      return;
+    }
 
-    const firstBreakeven = !signal.breakevenActive;
-    if (firstBreakeven) {
-      signal.breakevenActive = true;
+    // 1R reached: book 50% of the MT5 position and freeze the SL at entry
+    // (true breakeven) instead of the previous 1R lock.
+    signal.breakevenActive = true;
+    if (execution && execution.ticket !== null && !signal.partialBooked) {
+      signal.partialBooked = true;
+      execution.booking = true;
+      this.enqueueBroker(() => this.executeMt5PartialBook(signal, execution));
     }
-    let stopChanged = false;
-    if (nextStop !== signal.stopLoss) {
-      signal.stopLoss = nextStop;
-      stopChanged = true;
-      const execution = this.executions.get(signal.id);
-      if (execution && execution.ticket !== null) {
-        this.enqueueBroker(() => this.executeMt5Modify(signal, execution));
+    signal.stopLoss = signal.entry;
+    if (execution && execution.ticket !== null) {
+      this.enqueueBroker(() => this.executeMt5Modify(signal, execution));
+    }
+    this.opts.notifier?.breakeven(signal);
+    this.persistOpenSignals();
+  }
+
+  /** Closes half of the live MT5 position once 1R is reached. */
+  private async executeMt5PartialBook(
+    signal: TrackedSignal,
+    execution: SignalExecution
+  ): Promise<void> {
+    const broker = this.opts.mt5Broker;
+    const ticket = execution.ticket;
+    if (!broker?.isConnected() || ticket === null) {
+      execution.booking = false;
+      return;
+    }
+    const half = roundLot(execution.volume / 2);
+    if (!(half >= MIN_LOT_SIZE)) {
+      // Position is too small to split (e.g. 0.01 lots): keep the full lot
+      // running; the SL is already frozen at entry.
+      execution.booking = false;
+      signal.partialBooked = true;
+      return;
+    }
+    try {
+      const result = await broker.closePosition(ticket, half);
+      if (result.closed) {
+        execution.error = null;
+        this.lastError = null;
+        console.log(
+          `MT5 ${execution.symbol}: booked ${half} lots at the 1R trigger (position #${ticket}).`
+        );
+      } else {
+        execution.error = result.message ?? 'MT5 partial close failed.';
+        signal.partialBooked = false;
       }
-    }
-    if (firstBreakeven) {
-      this.opts.notifier?.breakeven(signal);
       this.persistOpenSignals();
-    } else if (stopChanged) {
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'MT5 partial close failed.';
+      execution.error = message;
+      signal.partialBooked = false;
+      this.lastError = `MT5 ${execution.symbol} partial close: ${message}`;
       this.persistOpenSignals();
+    } finally {
+      execution.booking = false;
     }
   }
 
