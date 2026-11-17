@@ -1,6 +1,8 @@
 ﻿/**
  * Server-side live signal engine for the Untested H1/M30 High-Volume Body + M1 Reversal strategy.
  * - Scans FX/CFD instruments (gold, WTI, majors, BTC) on OANDA data.
+ * - A level is never traded on its first touch: the first valid touch arms the level,
+ *   and the trade fires only on a retest with fresh M1 reversal + volume confirmation.
  * - Sizes each trade from the connected MT5 account balance (3% risk, per-pair SL, 2R TP).
  * - Watches every open signal against live M1 and S5 candles.
  * - At 1R profit (50% of the 2RR TP), books 50% of the MT5 position and freezes the SL at entry.
@@ -56,6 +58,28 @@ interface Zone {
   volRatio: number;
   distancePct: number;
   openTime: number;
+}
+
+/**
+ * A level that produced a valid first touch (reversal candle + volume confirmation)
+ * but was NOT traded. It waits for a retest: the price must move away from the zone
+ * and come back, and the retest candle must again close as a reversal candle with
+ * volume confirmation before the trade fires.
+ */
+interface ArmedLevel {
+  symbol: string;
+  direction: SignalDirection;
+  timeframe: Timeframe;
+  type: ZoneType;
+  bodyTop: number;
+  bodyBottom: number;
+  /** openTime of the M1 candle that armed the level (first touch). */
+  triggerCandleOpen: number;
+  /** Volume ratio of the arming candle. */
+  triggerRatio: number;
+  armedAt: number;
+  /** True once at least one closed M1 candle after arming did not touch the zone. */
+  sawDistancing: boolean;
 }
 
 interface TrackedSignal extends LiveSignal {
@@ -615,9 +639,9 @@ const STOP_LOSS_DISTANCE: Record<string, number> = {
   GBPCHF: 0.00027,
   AUDCHF: 0.00027,
   NZDCHF: 0.00027,
-  US30: 50,
-  US500: 7,
-  USTEC: 25,
+  US30: 100,
+  US500: 20,
+  USTEC: 70,
   UK100: 10,
   DE30: 25,
   FR40: 10,
@@ -643,6 +667,8 @@ const STOP_LOSS_DISTANCE: Record<string, number> = {
   DE10YB: 0.3,
 };
 const BREAKEVEN_TRIGGER_PCT = 50; // 1R reached = 50% of the 2RR TP distance
+// An armed level expires this long after the first touch if no retest fires.
+const ARMED_MAX_AGE_MS = 6 * 60 * 60_000;
 
 function clampRiskPercent(value: unknown): number {
   const parsed = Number(value);
@@ -1111,6 +1137,7 @@ export class SignalEngine {
   private readonly opts: EngineOptions;
   private signals = new Map<string, TrackedSignal>();
   private lastTriggerBySymbol = new Map<string, number>();
+  private armedLevels = new Map<string, ArmedLevel>();
   private stats: EngineStats = {
     total: 0,
     tp: 0,
@@ -2238,6 +2265,24 @@ export class SignalEngine {
     const supplyZones = zones.filter((z) => z.type === 'SUPPLY');
     const tolerance = TOUCH_TOLERANCE_PCT / 100;
 
+    // RETEST FLOW — no instant entry on the candle that closes at the level:
+    //  1) First touch (reversal candle + >=1.5x volume) ARMS the level — no trade.
+    //  2) The price must then move away from the zone and come back (retest).
+    //  3) A retest candle closing as a reversal candle with >=1.5x volume fires the trade.
+    //  4) A close beyond the far side of the zone (or expiry) disarms the level.
+    const armed = this.armedLevels.get(symbol);
+    const lastClosedIdx = m1.length - 2;
+    if (armed) {
+      const armedNear = near ? { ...near, armed: true } : near;
+      const outcome = this.evaluateArmedRetest(symbol, armed, m1, lastClosedIdx, tolerance);
+      if (outcome.disarmed) this.armedLevels.delete(symbol);
+      if (outcome.signal) {
+        this.lastTriggerBySymbol.set(symbol, outcome.signal.triggerCandleOpen);
+        return { ok: true, near: armedNear, signal: outcome.signal };
+      }
+      return { ok: true, near: armedNear, signal: null };
+    }
+
     let triggeredZone: Zone | null = null;
     let direction: SignalDirection | null = null;
     let triggerRatio = previousVolRatio;
@@ -2294,46 +2339,111 @@ export class SignalEngine {
       return { ok: true, near, signal: null };
     }
 
-    const targets = this.riskTargets(symbol);
-    if (!targets) return { ok: true, near, signal: null };
-    const stopLoss =
-      direction === 'LONG' ? price - targets.slDistance : price + targets.slDistance;
-    const takeProfit =
-      direction === 'LONG' ? price + targets.tpDistance : price - targets.tpDistance;
+    // Arm the level instead of trading the first touch. The trade fires later
+    // on a retest with fresh M1 confirmation (see evaluateArmedRetest).
+    this.armedLevels.set(symbol, {
+      symbol,
+      direction,
+      timeframe: triggeredZone.timeframe,
+      type: triggeredZone.type,
+      bodyTop: triggeredZone.bodyTop,
+      bodyBottom: triggeredZone.bodyBottom,
+      triggerCandleOpen: triggerCandle.openTime,
+      triggerRatio,
+      armedAt: Date.now(),
+      sawDistancing: false,
+    });
+    this.lastTriggerBySymbol.set(symbol, triggerCandle.openTime);
+    return { ok: true, near: near ? { ...near, armed: true } : near, signal: null };
+  }
 
-    const riskPct = (targets.slDistance / price) * 100;
-    const rewardPct = (targets.tpDistance / price) * 100;
-    const roePct = rewardPct * this.opts.leverage;
-    const timestampMs = Date.now();
-    const id = `${symbol}-${triggerCandle.openTime}-${direction}`;
+  /**
+   * Checks an armed level for a valid retest entry.
+   * - A close beyond the far side of the zone invalidates (disarms) the level.
+   * - A closed candle that does not touch the zone marks the "price moved away" state.
+   * - A later candle that retests the zone and closes as a reversal candle with
+   *   volume >= 1.5x the prior 10-candle average produces the entry signal.
+   */
+  private evaluateArmedRetest(
+    symbol: string,
+    armed: ArmedLevel,
+    m1: Kline[],
+    lastClosedIdx: number,
+    tolerance: number,
+  ): { signal: NewSignal | null; disarmed: boolean } {
+    if (Date.now() - armed.armedAt > ARMED_MAX_AGE_MS) {
+      return { signal: null, disarmed: true };
+    }
+    const isLong = armed.direction === 'LONG';
+    const touchUpper = isLong
+      ? armed.bodyTop * (1 + tolerance)
+      : armed.bodyTop * (1 + tolerance * 2);
+    const touchLower = isLong
+      ? armed.bodyBottom * (1 - tolerance * 2)
+      : armed.bodyBottom * (1 - tolerance);
+    const farSide = isLong
+      ? armed.bodyBottom * (1 - tolerance * 2)
+      : armed.bodyTop * (1 + tolerance * 2);
 
-    return {
-      ok: true,
-      near,
-      signal: {
-        id,
-        symbol,
-        direction,
-        timestampMs,
-        timeframe: triggeredZone.timeframe,
-        bodyTop: triggeredZone.bodyTop,
-        bodyBottom: triggeredZone.bodyBottom,
-        htfVolRatio: Number(triggeredZone.volRatio.toFixed(2)),
-        m1VolRatio: Number(triggerRatio.toFixed(2)),
-        entry: price,
-        stopLoss,
-        takeProfit,
-        riskPct: Number(riskPct.toFixed(3)),
-        rewardPct: Number(rewardPct.toFixed(3)),
-        roePct: Number(roePct.toFixed(2)),
-        leverage: this.opts.leverage,
-        triggerCandleOpen: triggerCandle.openTime,
-        reason:
-          `${symbol} touched untested ${triggeredZone.timeframe} ${triggeredZone.type.toLowerCase()} body ` +
-          `(${triggeredZone.volRatio.toFixed(1)}x HTF volume, ${triggeredZone.bodyBottom.toPrecision(6)}-` +
-          `${triggeredZone.bodyTop.toPrecision(6)}) and printed a ${triggerRatio.toFixed(1)}x volume M1 reversal candle.`,
-      },
-    };
+    for (let i = 0; i <= lastClosedIdx; i += 1) {
+      const candle = m1[i];
+      if (candle.openTime <= armed.triggerCandleOpen) continue;
+      const touched = isLong
+        ? candle.low <= touchUpper && candle.high >= touchLower
+        : candle.high >= touchLower && candle.low <= touchUpper;
+      const farSideClose = isLong ? candle.close < farSide : candle.close > farSide;
+      if (farSideClose) {
+        // Price closed through the far side of the zone: level failed.
+        return { signal: null, disarmed: true };
+      }
+      if (!touched) {
+        armed.sawDistancing = true;
+        continue;
+      }
+      if (!armed.sawDistancing) continue; // still the first visit — wait for the retest
+      const avgVol = averageVolume(m1, i - M1_VOL_LOOKBACK, i);
+      const ratio = avgVol > 0 ? candle.volume / avgVol : 1;
+      const reversal = isLong
+        ? candle.close > candle.open && candle.close >= armed.bodyBottom
+        : candle.close < candle.open && candle.close <= armed.bodyTop;
+      if (!reversal || ratio < M1_VOL_MULTIPLIER) continue;
+
+      const targets = this.riskTargets(symbol);
+      if (!targets) return { signal: null, disarmed: false };
+      const price = candle.close;
+      const stopLoss = isLong ? price - targets.slDistance : price + targets.slDistance;
+      const takeProfit = isLong ? price + targets.tpDistance : price - targets.tpDistance;
+      const riskPct = (targets.slDistance / price) * 100;
+      const rewardPct = (targets.tpDistance / price) * 100;
+      return {
+        disarmed: true,
+        signal: {
+          id: `${symbol}-${candle.openTime}-${armed.direction}-RETEST`,
+          symbol,
+          direction: armed.direction,
+          timestampMs: Date.now(),
+          timeframe: armed.timeframe,
+          bodyTop: armed.bodyTop,
+          bodyBottom: armed.bodyBottom,
+          htfVolRatio: Number(armed.triggerRatio.toFixed(2)),
+          m1VolRatio: Number(ratio.toFixed(2)),
+          entry: price,
+          stopLoss,
+          takeProfit,
+          riskPct: Number(riskPct.toFixed(3)),
+          rewardPct: Number(rewardPct.toFixed(3)),
+          roePct: Number((rewardPct * this.opts.leverage).toFixed(2)),
+          leverage: this.opts.leverage,
+          triggerCandleOpen: candle.openTime,
+          reason:
+            `${symbol} retested the armed ${armed.timeframe} ${armed.type.toLowerCase()} body ` +
+            `(${armed.bodyBottom.toPrecision(6)}-${armed.bodyTop.toPrecision(6)}, armed at ` +
+            `${armed.triggerRatio.toFixed(1)}x HTF volume) and printed a ${ratio.toFixed(1)}x ` +
+            `volume M1 reversal candle — retest entry.`,
+        },
+      };
+    }
+    return { signal: null, disarmed: false };
   }
 
   private hasRecentSignal(signal: NewSignal): boolean {

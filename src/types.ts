@@ -52,6 +52,8 @@ export interface NearZone {
   bodyBottom: number;
   distancePct: number;
   volRatio: number;
+  /** True when the level is armed and waiting for a retest before entry. */
+  armed?: boolean;
 }
 
 export interface MarketTicker {
