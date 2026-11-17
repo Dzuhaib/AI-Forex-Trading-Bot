@@ -61,10 +61,11 @@ interface Zone {
 }
 
 /**
- * A level that produced a valid first touch (reversal candle + volume confirmation)
- * but was NOT traded. It waits for a retest: the price must move away from the zone
- * and come back, and the retest candle must again close as a reversal candle with
- * volume confirmation before the trade fires.
+ * A level created by an H1/M30 candle close that was touched by the first M1
+ * candle after that close. It is NOT traded on this first touch: it waits for a
+ * retest — the price must move away from the zone and come back, and the retest
+ * candle must close as a reversal candle with volume confirmation before the
+ * trade fires.
  */
 interface ArmedLevel {
   symbol: string;
@@ -2265,10 +2266,12 @@ export class SignalEngine {
     const supplyZones = zones.filter((z) => z.type === 'SUPPLY');
     const tolerance = TOUCH_TOLERANCE_PCT / 100;
 
-    // RETEST FLOW — no instant entry on the candle that closes at the level:
-    //  1) First touch (reversal candle + >=1.5x volume) ARMS the level — no trade.
-    //  2) The price must then move away from the zone and come back (retest).
-    //  3) A retest candle closing as a reversal candle with >=1.5x volume fires the trade.
+    // RETEST FLOW — no trade on the first M1 candle after the H1/M30 level is created:
+    //  1) The first M1 candle that touches the fresh level ARMS it — no trade, no
+    //     confirmation needed on this first touch.
+    //  2) The price must then move away from the zone (a closed M1 candle not touching it).
+    //  3) When the market RETESTS the level and the retest M1 candle closes as a
+    //     reversal candle with >=1.5x volume, the trade fires.
     //  4) A close beyond the far side of the zone (or expiry) disarms the level.
     const armed = this.armedLevels.get(symbol);
     const lastClosedIdx = m1.length - 2;
@@ -2288,13 +2291,15 @@ export class SignalEngine {
     let triggerRatio = previousVolRatio;
     let triggerCandle = previousCandle;
 
+    // ARMING — the first M1 candle that touches a level right after the H1/M30
+    // candle closes arms it. No reversal or volume requirement here: the level is
+    // simply marked. The trade only fires later, on a retest with M1 confirmation.
     for (const zone of demandZones) {
       const upper = zone.bodyTop * (1 + tolerance);
       const lower = zone.bodyBottom * (1 - tolerance * 2);
       for (const [candle, ratio] of confirmationCandles) {
         const touched = candle.low <= upper && candle.high >= lower;
-        const isGreen = candle.close > candle.open && candle.close >= zone.bodyBottom;
-        if (touched && isGreen && ratio >= M1_VOL_MULTIPLIER) {
+        if (touched) {
           triggeredZone = zone;
           direction = 'LONG';
           triggerRatio = ratio;
@@ -2311,8 +2316,7 @@ export class SignalEngine {
         const upper = zone.bodyTop * (1 + tolerance * 2);
         for (const [candle, ratio] of confirmationCandles) {
           const touched = candle.high >= lower && candle.low <= upper;
-          const isRed = candle.close < candle.open && candle.close <= zone.bodyTop;
-          if (touched && isRed && ratio >= M1_VOL_MULTIPLIER) {
+          if (touched) {
             triggeredZone = zone;
             direction = 'SHORT';
             triggerRatio = ratio;
@@ -2339,7 +2343,7 @@ export class SignalEngine {
       return { ok: true, near, signal: null };
     }
 
-    // Arm the level instead of trading the first touch. The trade fires later
+    // Arm the level on the first touch instead of trading it. The trade fires later
     // on a retest with fresh M1 confirmation (see evaluateArmedRetest).
     this.armedLevels.set(symbol, {
       symbol,
