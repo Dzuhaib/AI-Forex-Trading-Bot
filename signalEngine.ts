@@ -1,7 +1,10 @@
 ﻿/**
  * Server-side live signal engine for the Untested H1/M30 High-Volume Body + M1 Reversal strategy.
  * - Scans FX/CFD instruments (gold, WTI, majors, BTC) on OANDA data.
- * - A level is never traded on its first touch: the first valid touch arms the level,
+ * - Every high-volume H1/M30 candle body is marked as TWO separate levels (upper
+ *   half and lower half). Direction is positional: a level below the market price
+ *   is bought when reached, a level above the market price is sold when reached.
+ * - A level is never traded on its first touch: the first touch arms the level,
  *   and the trade fires only on a retest with fresh M1 reversal + volume confirmation.
  * - Sizes each trade from the connected MT5 account balance (3% risk, per-pair SL, 2R TP).
  * - Watches every open signal against live M1 and S5 candles.
@@ -1056,67 +1059,83 @@ function findUntestedHtfBodyZones(candles: Kline[], timeframe: Timeframe, curren
     const bodyTop = Math.max(candle.open, candle.close);
     const bodyBottom = Math.min(candle.open, candle.close);
     if (bodyTop <= bodyBottom) continue;
+    const bodyMid = (bodyTop + bodyBottom) / 2;
 
-    // UNTESTED SEMANTICS: a level stays available while price has moved away and
-    // has NOT retested it. The first return visit after leaving is the arming
-    // touch and keeps the level available. A SECOND separate return visit (the
-    // retest) marks the level tested and removes it.
-    let leftAbove = false;
-    let returnEpisodesAbove = 0;
-    let inTouchAbove = false;
-    let leftBelow = false;
-    let returnEpisodesBelow = 0;
-    let inTouchBelow = false;
+    // The body is marked as TWO separate levels: its upper half and its lower
+    // half. Direction is purely positional — a level BELOW the market price is
+    // a buy level (DEMAND), a level ABOVE the market price is a sell level
+    // (SUPPLY). Entry itself still requires the M1 confirmations (arm -> retest).
+    const halves: Array<{ top: number; bottom: number }> = [
+      { top: bodyTop, bottom: bodyMid }, // upper half
+      { top: bodyMid, bottom: bodyBottom }, // lower half
+    ];
 
-    for (let k = i + 1; k < n - 1; k += 1) {
-      const sub = candles[k];
-      if (!leftAbove) {
-        if (sub.low > bodyTop) leftAbove = true;
-      } else {
-        const touching = sub.low <= bodyTop;
-        if (touching && !inTouchAbove) {
-          returnEpisodesAbove += 1;
-          inTouchAbove = true;
+    for (const half of halves) {
+      if (half.top <= half.bottom) continue;
+
+      // UNTESTED SEMANTICS: a level stays available while price has moved away
+      // from it and has NOT retested it. The first return visit after leaving is
+      // the arming touch and keeps the level available. A SECOND separate return
+      // visit (the retest) marks the level tested and removes it.
+      let leftAbove = false;
+      let returnEpisodesAbove = 0;
+      let inTouchAbove = false;
+      let leftBelow = false;
+      let returnEpisodesBelow = 0;
+      let inTouchBelow = false;
+
+      for (let k = i + 1; k < n - 1; k += 1) {
+        const sub = candles[k];
+        if (!leftAbove) {
+          if (sub.low > half.top) leftAbove = true;
+        } else {
+          const touching = sub.low <= half.top;
+          if (touching && !inTouchAbove) {
+            returnEpisodesAbove += 1;
+            inTouchAbove = true;
+          }
+          if (!touching) inTouchAbove = false;
         }
-        if (!touching) inTouchAbove = false;
-      }
-      if (!leftBelow) {
-        if (sub.high < bodyBottom) leftBelow = true;
-      } else {
-        const touching = sub.high >= bodyBottom;
-        if (touching && !inTouchBelow) {
-          returnEpisodesBelow += 1;
-          inTouchBelow = true;
+        if (!leftBelow) {
+          if (sub.high < half.bottom) leftBelow = true;
+        } else {
+          const touching = sub.high >= half.bottom;
+          if (touching && !inTouchBelow) {
+            returnEpisodesBelow += 1;
+            inTouchBelow = true;
+          }
+          if (!touching) inTouchBelow = false;
         }
-        if (!touching) inTouchBelow = false;
       }
-    }
 
-    if (i === n - 2) {
-      if (currentPrice > bodyTop) leftAbove = true;
-      if (currentPrice < bodyBottom) leftBelow = true;
-    }
+      if (i === n - 2) {
+        if (currentPrice > half.top) leftAbove = true;
+        if (currentPrice < half.bottom) leftBelow = true;
+      }
 
-    if (leftAbove && returnEpisodesAbove < 2 && currentPrice >= bodyBottom * 0.997) {
-      const distancePct =
-        currentPrice >= bodyTop ? ((currentPrice - bodyTop) / currentPrice) * 100 : 0;
+      let type: ZoneType | null = null;
+      let distancePct = 0;
+      if (currentPrice > half.top) {
+        // Level is below the market price -> buy level when price reaches it.
+        if (leftAbove && returnEpisodesAbove < 2) {
+          type = 'DEMAND';
+          distancePct = ((currentPrice - half.top) / currentPrice) * 100;
+        }
+      } else if (currentPrice < half.bottom) {
+        // Level is above the market price -> sell level when price reaches it.
+        if (leftBelow && returnEpisodesBelow < 2) {
+          type = 'SUPPLY';
+          distancePct = ((half.bottom - currentPrice) / currentPrice) * 100;
+        }
+      }
+      // Price inside the half: direction is ambiguous, the level is not offered.
+      if (!type) continue;
+
       zones.push({
         timeframe,
-        type: 'DEMAND',
-        bodyTop,
-        bodyBottom,
-        volRatio,
-        distancePct,
-        openTime: candle.openTime,
-      });
-    } else if (leftBelow && returnEpisodesBelow < 2 && currentPrice <= bodyTop * 1.003) {
-      const distancePct =
-        currentPrice <= bodyBottom ? ((bodyBottom - currentPrice) / currentPrice) * 100 : 0;
-      zones.push({
-        timeframe,
-        type: 'SUPPLY',
-        bodyTop,
-        bodyBottom,
+        type,
+        bodyTop: half.top,
+        bodyBottom: half.bottom,
         volRatio,
         distancePct,
         openTime: candle.openTime,
