@@ -52,6 +52,8 @@ export interface NearZone {
   bodyBottom: number;
   distancePct: number;
   volRatio: number;
+  /** True when the level is marked untested and waiting for a retest before entry. */
+  untested?: boolean;
 }
 
 export interface MarketTicker {

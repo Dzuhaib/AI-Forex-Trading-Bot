@@ -470,9 +470,15 @@ function NearZoneCard({ zone }: { zone: NearZone }) {
           />
           {zone.type === 'DEMAND' ? 'Demand' : 'Supply'}
         </span>
-        <span className="text-[10px] font-medium tabular-nums text-[#86868b]">
-          {zone.distancePct.toFixed(2)}%
-        </span>
+        {zone.untested ? (
+          <span className="inline-flex items-center gap-1 rounded-full bg-[#1d1d1f] px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-white">
+            Untested
+          </span>
+        ) : (
+          <span className="text-[10px] font-medium tabular-nums text-[#86868b]">
+            {zone.distancePct.toFixed(2)}%
+          </span>
+        )}
       </div>
       <div className="mt-1.5 text-[10px] tabular-nums text-[#86868b]">
         ${formatPrice(zone.bodyBottom)} – ${formatPrice(zone.bodyTop)}
