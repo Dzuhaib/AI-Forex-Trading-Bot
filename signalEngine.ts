@@ -2315,7 +2315,6 @@ export class SignalEngine {
       const outcome = this.evaluateUntestedRetest(symbol, untested, m1, lastClosedIdx, tolerance);
       if (outcome.consumed) this.untestedLevels.delete(symbol);
       if (outcome.signal) {
-        this.lastTriggerBySymbol.set(symbol, outcome.signal.triggerCandleOpen);
         return { ok: true, near: untestedNear, signal: outcome.signal };
       }
       return { ok: true, near: untestedNear, signal: null };
