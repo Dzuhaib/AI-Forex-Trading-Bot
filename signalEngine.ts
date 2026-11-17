@@ -1057,22 +1057,38 @@ function findUntestedHtfBodyZones(candles: Kline[], timeframe: Timeframe, curren
     const bodyBottom = Math.min(candle.open, candle.close);
     if (bodyTop <= bodyBottom) continue;
 
+    // UNTESTED SEMANTICS: a level stays available while price has moved away and
+    // has NOT retested it. The first return visit after leaving is the arming
+    // touch and keeps the level available. A SECOND separate return visit (the
+    // retest) marks the level tested and removes it.
     let leftAbove = false;
-    let testedFromAbove = false;
+    let returnEpisodesAbove = 0;
+    let inTouchAbove = false;
     let leftBelow = false;
-    let testedFromBelow = false;
+    let returnEpisodesBelow = 0;
+    let inTouchBelow = false;
 
     for (let k = i + 1; k < n - 1; k += 1) {
       const sub = candles[k];
       if (!leftAbove) {
         if (sub.low > bodyTop) leftAbove = true;
-      } else if (sub.low <= bodyTop) {
-        testedFromAbove = true;
+      } else {
+        const touching = sub.low <= bodyTop;
+        if (touching && !inTouchAbove) {
+          returnEpisodesAbove += 1;
+          inTouchAbove = true;
+        }
+        if (!touching) inTouchAbove = false;
       }
       if (!leftBelow) {
         if (sub.high < bodyBottom) leftBelow = true;
-      } else if (sub.high >= bodyBottom) {
-        testedFromBelow = true;
+      } else {
+        const touching = sub.high >= bodyBottom;
+        if (touching && !inTouchBelow) {
+          returnEpisodesBelow += 1;
+          inTouchBelow = true;
+        }
+        if (!touching) inTouchBelow = false;
       }
     }
 
@@ -1081,7 +1097,7 @@ function findUntestedHtfBodyZones(candles: Kline[], timeframe: Timeframe, curren
       if (currentPrice < bodyBottom) leftBelow = true;
     }
 
-    if (leftAbove && !testedFromAbove && currentPrice >= bodyBottom * 0.997) {
+    if (leftAbove && returnEpisodesAbove < 2 && currentPrice >= bodyBottom * 0.997) {
       const distancePct =
         currentPrice >= bodyTop ? ((currentPrice - bodyTop) / currentPrice) * 100 : 0;
       zones.push({
@@ -1093,7 +1109,7 @@ function findUntestedHtfBodyZones(candles: Kline[], timeframe: Timeframe, curren
         distancePct,
         openTime: candle.openTime,
       });
-    } else if (leftBelow && !testedFromBelow && currentPrice <= bodyTop * 1.003) {
+    } else if (leftBelow && returnEpisodesBelow < 2 && currentPrice <= bodyTop * 1.003) {
       const distancePct =
         currentPrice <= bodyBottom ? ((bodyBottom - currentPrice) / currentPrice) * 100 : 0;
       zones.push({
@@ -2367,6 +2383,9 @@ export class SignalEngine {
    * - A closed candle that does not touch the zone marks the "price moved away" state.
    * - A later candle that retests the zone and closes as a reversal candle with
    *   volume >= 1.5x the prior 10-candle average produces the entry signal.
+   * - The level gets exactly one retest: if that retest visit ends without an
+   *   M1 confirmation, the level is consumed (a retested level is no longer
+   *   available to trade).
    */
   private evaluateArmedRetest(
     symbol: string,
@@ -2379,6 +2398,7 @@ export class SignalEngine {
       return { signal: null, disarmed: true };
     }
     const isLong = armed.direction === 'LONG';
+    let retested = false;
     const touchUpper = isLong
       ? armed.bodyTop * (1 + tolerance)
       : armed.bodyTop * (1 + tolerance * 2);
@@ -2401,10 +2421,16 @@ export class SignalEngine {
         return { signal: null, disarmed: true };
       }
       if (!touched) {
+        if (retested) {
+          // The retest visit ended without an M1 confirmation: per the untested
+          // rule, a retested level is consumed and no longer available.
+          return { signal: null, disarmed: true };
+        }
         armed.sawDistancing = true;
         continue;
       }
       if (!armed.sawDistancing) continue; // still the first visit — wait for the retest
+      retested = true;
       const avgVol = averageVolume(m1, i - M1_VOL_LOOKBACK, i);
       const ratio = avgVol > 0 ? candle.volume / avgVol : 1;
       const reversal = isLong
