@@ -470,9 +470,9 @@ function NearZoneCard({ zone }: { zone: NearZone }) {
           />
           {zone.type === 'DEMAND' ? 'Demand' : 'Supply'}
         </span>
-        {zone.armed ? (
+        {zone.untested ? (
           <span className="inline-flex items-center gap-1 rounded-full bg-[#1d1d1f] px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-white">
-            Armed
+            Untested
           </span>
         ) : (
           <span className="text-[10px] font-medium tabular-nums text-[#86868b]">

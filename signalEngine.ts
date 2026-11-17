@@ -4,7 +4,7 @@
  * - Every high-volume H1/M30 candle body is marked as TWO separate levels (upper
  *   half and lower half). Direction is positional: a level below the market price
  *   is bought when reached, a level above the market price is sold when reached.
- * - A level is never traded on its first touch: the first touch arms the level,
+ * - A level is never traded on its first touch: the first touch marks it untested,
  *   and the trade fires only on a retest with fresh M1 reversal + volume confirmation.
  * - Sizes each trade from the connected MT5 account balance (3% risk, per-pair SL, 2R TP).
  * - Watches every open signal against live M1 and S5 candles.
@@ -65,24 +65,24 @@ interface Zone {
 
 /**
  * A level created by an H1/M30 candle close that was touched by the first M1
- * candle after that close. It is NOT traded on this first touch: it waits for a
- * retest — the price must move away from the zone and come back, and the retest
- * candle must close as a reversal candle with volume confirmation before the
- * trade fires.
+ * candle after that close. From that touch it is marked UNTESTED and is NOT
+ * traded: it waits for a retest — the price must move away from the zone and
+ * come back, and the retest candle must close as a reversal candle with volume
+ * confirmation before the (single) trade fires.
  */
-interface ArmedLevel {
+interface UntestedLevel {
   symbol: string;
   direction: SignalDirection;
   timeframe: Timeframe;
   type: ZoneType;
   bodyTop: number;
   bodyBottom: number;
-  /** openTime of the M1 candle that armed the level (first touch). */
+  /** openTime of the M1 candle that marked the level untested (first touch). */
   triggerCandleOpen: number;
-  /** Volume ratio of the arming candle. */
+  /** Volume ratio of the first-touch candle. */
   triggerRatio: number;
-  armedAt: number;
-  /** True once at least one closed M1 candle after arming did not touch the zone. */
+  markedAt: number;
+  /** True once at least one closed M1 candle after the first touch did not touch the zone. */
   sawDistancing: boolean;
 }
 
@@ -671,8 +671,8 @@ const STOP_LOSS_DISTANCE: Record<string, number> = {
   DE10YB: 0.3,
 };
 const BREAKEVEN_TRIGGER_PCT = 50; // 1R reached = 50% of the 2RR TP distance
-// An armed level expires this long after the first touch if no retest fires.
-const ARMED_MAX_AGE_MS = 6 * 60 * 60_000;
+// An untested level expires this long after the first touch if no retest fires.
+const UNTESTED_MAX_AGE_MS = 6 * 60 * 60_000;
 
 function clampRiskPercent(value: unknown): number {
   const parsed = Number(value);
@@ -1173,7 +1173,7 @@ export class SignalEngine {
   private readonly opts: EngineOptions;
   private signals = new Map<string, TrackedSignal>();
   private lastTriggerBySymbol = new Map<string, number>();
-  private armedLevels = new Map<string, ArmedLevel>();
+  private untestedLevels = new Map<string, UntestedLevel>();
   private stats: EngineStats = {
     total: 0,
     tp: 0,
@@ -2302,23 +2302,23 @@ export class SignalEngine {
     const tolerance = TOUCH_TOLERANCE_PCT / 100;
 
     // RETEST FLOW — no trade on the first M1 candle after the H1/M30 level is created:
-    //  1) The first M1 candle that touches the fresh level ARMS it — no trade, no
-    //     confirmation needed on this first touch.
+    //  1) The first M1 candle that touches the fresh level marks it UNTESTED — no
+    //     trade, no confirmation needed on this first touch.
     //  2) The price must then move away from the zone (a closed M1 candle not touching it).
     //  3) When the market RETESTS the level and the retest M1 candle closes as a
-    //     reversal candle with >=1.5x volume, the trade fires.
-    //  4) A close beyond the far side of the zone (or expiry) disarms the level.
-    const armed = this.armedLevels.get(symbol);
+    //     reversal candle with >=1.5x volume, the trade fires — once per level.
+    //  4) A close beyond the far side of the zone (or expiry) consumes the level.
+    const untested = this.untestedLevels.get(symbol);
     const lastClosedIdx = m1.length - 2;
-    if (armed) {
-      const armedNear = near ? { ...near, armed: true } : near;
-      const outcome = this.evaluateArmedRetest(symbol, armed, m1, lastClosedIdx, tolerance);
-      if (outcome.disarmed) this.armedLevels.delete(symbol);
+    if (untested) {
+      const untestedNear = near ? { ...near, untested: true } : near;
+      const outcome = this.evaluateUntestedRetest(symbol, untested, m1, lastClosedIdx, tolerance);
+      if (outcome.consumed) this.untestedLevels.delete(symbol);
       if (outcome.signal) {
         this.lastTriggerBySymbol.set(symbol, outcome.signal.triggerCandleOpen);
-        return { ok: true, near: armedNear, signal: outcome.signal };
+        return { ok: true, near: untestedNear, signal: outcome.signal };
       }
-      return { ok: true, near: armedNear, signal: null };
+      return { ok: true, near: untestedNear, signal: null };
     }
 
     let triggeredZone: Zone | null = null;
@@ -2326,9 +2326,10 @@ export class SignalEngine {
     let triggerRatio = previousVolRatio;
     let triggerCandle = previousCandle;
 
-    // ARMING — the first M1 candle that touches a level right after the H1/M30
-    // candle closes arms it. No reversal or volume requirement here: the level is
-    // simply marked. The trade only fires later, on a retest with M1 confirmation.
+    // FIRST TOUCH — the first M1 candle that touches a level right after the
+    // H1/M30 candle closes marks it UNTESTED. No reversal or volume requirement
+    // here: the level is simply marked. The trade only fires later, on a retest
+    // with M1 confirmation.
     for (const zone of demandZones) {
       const upper = zone.bodyTop * (1 + tolerance);
       const lower = zone.bodyBottom * (1 - tolerance * 2);
@@ -2378,9 +2379,9 @@ export class SignalEngine {
       return { ok: true, near, signal: null };
     }
 
-    // Arm the level on the first touch instead of trading it. The trade fires later
-    // on a retest with fresh M1 confirmation (see evaluateArmedRetest).
-    this.armedLevels.set(symbol, {
+    // Mark the level UNTESTED on the first touch instead of trading it. The trade
+    // fires later on a retest with fresh M1 confirmation (see evaluateUntestedRetest).
+    this.untestedLevels.set(symbol, {
       symbol,
       direction,
       timeframe: triggeredZone.timeframe,
@@ -2389,16 +2390,16 @@ export class SignalEngine {
       bodyBottom: triggeredZone.bodyBottom,
       triggerCandleOpen: triggerCandle.openTime,
       triggerRatio,
-      armedAt: Date.now(),
+      markedAt: Date.now(),
       sawDistancing: false,
     });
     this.lastTriggerBySymbol.set(symbol, triggerCandle.openTime);
-    return { ok: true, near: near ? { ...near, armed: true } : near, signal: null };
+    return { ok: true, near: near ? { ...near, untested: true } : near, signal: null };
   }
 
   /**
-   * Checks an armed level for a valid retest entry.
-   * - A close beyond the far side of the zone invalidates (disarms) the level.
+   * Checks an untested level for a valid retest entry.
+   * - A close beyond the far side of the zone consumes the level.
    * - A closed candle that does not touch the zone marks the "price moved away" state.
    * - A later candle that retests the zone and closes as a reversal candle with
    *   volume >= 1.5x the prior 10-candle average produces the entry signal.
@@ -2406,75 +2407,75 @@ export class SignalEngine {
    *   M1 confirmation, the level is consumed (a retested level is no longer
    *   available to trade).
    */
-  private evaluateArmedRetest(
+  private evaluateUntestedRetest(
     symbol: string,
-    armed: ArmedLevel,
+    untested: UntestedLevel,
     m1: Kline[],
     lastClosedIdx: number,
     tolerance: number,
-  ): { signal: NewSignal | null; disarmed: boolean } {
-    if (Date.now() - armed.armedAt > ARMED_MAX_AGE_MS) {
-      return { signal: null, disarmed: true };
+  ): { signal: NewSignal | null; consumed: boolean } {
+    if (Date.now() - untested.markedAt > UNTESTED_MAX_AGE_MS) {
+      return { signal: null, consumed: true };
     }
-    const isLong = armed.direction === 'LONG';
+    const isLong = untested.direction === 'LONG';
     let retested = false;
     const touchUpper = isLong
-      ? armed.bodyTop * (1 + tolerance)
-      : armed.bodyTop * (1 + tolerance * 2);
+      ? untested.bodyTop * (1 + tolerance)
+      : untested.bodyTop * (1 + tolerance * 2);
     const touchLower = isLong
-      ? armed.bodyBottom * (1 - tolerance * 2)
-      : armed.bodyBottom * (1 - tolerance);
+      ? untested.bodyBottom * (1 - tolerance * 2)
+      : untested.bodyBottom * (1 - tolerance);
     const farSide = isLong
-      ? armed.bodyBottom * (1 - tolerance * 2)
-      : armed.bodyTop * (1 + tolerance * 2);
+      ? untested.bodyBottom * (1 - tolerance * 2)
+      : untested.bodyTop * (1 + tolerance * 2);
 
     for (let i = 0; i <= lastClosedIdx; i += 1) {
       const candle = m1[i];
-      if (candle.openTime <= armed.triggerCandleOpen) continue;
+      if (candle.openTime <= untested.triggerCandleOpen) continue;
       const touched = isLong
         ? candle.low <= touchUpper && candle.high >= touchLower
         : candle.high >= touchLower && candle.low <= touchUpper;
       const farSideClose = isLong ? candle.close < farSide : candle.close > farSide;
       if (farSideClose) {
         // Price closed through the far side of the zone: level failed.
-        return { signal: null, disarmed: true };
+        return { signal: null, consumed: true };
       }
       if (!touched) {
         if (retested) {
           // The retest visit ended without an M1 confirmation: per the untested
           // rule, a retested level is consumed and no longer available.
-          return { signal: null, disarmed: true };
+          return { signal: null, consumed: true };
         }
-        armed.sawDistancing = true;
+        untested.sawDistancing = true;
         continue;
       }
-      if (!armed.sawDistancing) continue; // still the first visit — wait for the retest
+      if (!untested.sawDistancing) continue; // still the first visit — wait for the retest
       retested = true;
       const avgVol = averageVolume(m1, i - M1_VOL_LOOKBACK, i);
       const ratio = avgVol > 0 ? candle.volume / avgVol : 1;
       const reversal = isLong
-        ? candle.close > candle.open && candle.close >= armed.bodyBottom
-        : candle.close < candle.open && candle.close <= armed.bodyTop;
+        ? candle.close > candle.open && candle.close >= untested.bodyBottom
+        : candle.close < candle.open && candle.close <= untested.bodyTop;
       if (!reversal || ratio < M1_VOL_MULTIPLIER) continue;
 
       const targets = this.riskTargets(symbol);
-      if (!targets) return { signal: null, disarmed: false };
+      if (!targets) return { signal: null, consumed: false };
       const price = candle.close;
       const stopLoss = isLong ? price - targets.slDistance : price + targets.slDistance;
       const takeProfit = isLong ? price + targets.tpDistance : price - targets.tpDistance;
       const riskPct = (targets.slDistance / price) * 100;
       const rewardPct = (targets.tpDistance / price) * 100;
       return {
-        disarmed: true,
+        consumed: true,
         signal: {
-          id: `${symbol}-${candle.openTime}-${armed.direction}-RETEST`,
+          id: `${symbol}-${candle.openTime}-${untested.direction}-RETEST`,
           symbol,
-          direction: armed.direction,
+          direction: untested.direction,
           timestampMs: Date.now(),
-          timeframe: armed.timeframe,
-          bodyTop: armed.bodyTop,
-          bodyBottom: armed.bodyBottom,
-          htfVolRatio: Number(armed.triggerRatio.toFixed(2)),
+          timeframe: untested.timeframe,
+          bodyTop: untested.bodyTop,
+          bodyBottom: untested.bodyBottom,
+          htfVolRatio: Number(untested.triggerRatio.toFixed(2)),
           m1VolRatio: Number(ratio.toFixed(2)),
           entry: price,
           stopLoss,
@@ -2485,14 +2486,14 @@ export class SignalEngine {
           leverage: this.opts.leverage,
           triggerCandleOpen: candle.openTime,
           reason:
-            `${symbol} retested the armed ${armed.timeframe} ${armed.type.toLowerCase()} body ` +
-            `(${armed.bodyBottom.toPrecision(6)}-${armed.bodyTop.toPrecision(6)}, armed at ` +
-            `${armed.triggerRatio.toFixed(1)}x HTF volume) and printed a ${ratio.toFixed(1)}x ` +
+            `${symbol} retested the untested ${untested.timeframe} ${untested.type.toLowerCase()} body ` +
+            `(${untested.bodyBottom.toPrecision(6)}-${untested.bodyTop.toPrecision(6)}, first touched at ` +
+            `${untested.triggerRatio.toFixed(1)}x HTF volume) and printed a ${ratio.toFixed(1)}x ` +
             `volume M1 reversal candle — retest entry.`,
         },
       };
     }
-    return { signal: null, disarmed: false };
+    return { signal: null, consumed: false };
   }
 
   private hasRecentSignal(signal: NewSignal): boolean {
