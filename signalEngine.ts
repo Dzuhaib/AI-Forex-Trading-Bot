@@ -671,8 +671,6 @@ const STOP_LOSS_DISTANCE: Record<string, number> = {
   DE10YB: 0.3,
 };
 const BREAKEVEN_TRIGGER_PCT = 50; // 1R reached = 50% of the 2RR TP distance
-// An untested level expires this long after the first touch if no retest fires.
-const UNTESTED_MAX_AGE_MS = 6 * 60 * 60_000;
 
 function clampRiskPercent(value: unknown): number {
   const parsed = Number(value);
@@ -1042,6 +1040,17 @@ function averageVolume(candles: Kline[], from: number, to: number): number {
     }
   }
   return count > 0 ? sum / count : 0;
+}
+
+/**
+ * Stable map key for an untested level: every first-touch-marked level is
+ * remembered under its own key, so multiple untested levels coexist per symbol.
+ */
+function untestedLevelKey(
+  symbol: string,
+  zone: Pick<Zone, 'timeframe' | 'type' | 'bodyBottom' | 'bodyTop'>,
+): string {
+  return `${symbol}:${zone.timeframe}:${zone.type}:${zone.bodyBottom}:${zone.bodyTop}`;
 }
 
 function findUntestedHtfBodyZones(candles: Kline[], timeframe: Timeframe, currentPrice: number): Zone[] {
@@ -2302,99 +2311,82 @@ export class SignalEngine {
     const tolerance = TOUCH_TOLERANCE_PCT / 100;
 
     // RETEST FLOW — no trade on the first M1 candle after the H1/M30 level is created:
-    //  1) The first M1 candle that touches the fresh level marks it UNTESTED — no
-    //     trade, no confirmation needed on this first touch.
+    //  1) The first M1 candle that touches a level marks it UNTESTED — no trade,
+    //     no confirmation needed on this first touch.
     //  2) The price must then move away from the zone (a closed M1 candle not touching it).
-    //  3) When the market RETESTS the level and the retest M1 candle closes as a
-    //     reversal candle with >=1.5x volume, the trade fires — once per level.
-    //  4) A close beyond the far side of the zone (or expiry) consumes the level.
-    const untested = this.untestedLevels.get(symbol);
-    const lastClosedIdx = m1.length - 2;
-    if (untested) {
-      const untestedNear = near ? { ...near, untested: true } : near;
-      const outcome = this.evaluateUntestedRetest(symbol, untested, m1, lastClosedIdx, tolerance);
-      if (outcome.consumed) this.untestedLevels.delete(symbol);
-      if (outcome.signal) {
-        this.lastTriggerBySymbol.set(symbol, outcome.signal.triggerCandleOpen);
-        return { ok: true, near: untestedNear, signal: outcome.signal };
-      }
-      return { ok: true, near: untestedNear, signal: null };
-    }
-
-    let triggeredZone: Zone | null = null;
-    let direction: SignalDirection | null = null;
-    let triggerRatio = previousVolRatio;
-    let triggerCandle = previousCandle;
-
-    // FIRST TOUCH — the first M1 candle that touches a level right after the
-    // H1/M30 candle closes marks it UNTESTED. No reversal or volume requirement
-    // here: the level is simply marked. The trade only fires later, on a retest
-    // with M1 confirmation.
-    for (const zone of demandZones) {
-      const upper = zone.bodyTop * (1 + tolerance);
-      const lower = zone.bodyBottom * (1 - tolerance * 2);
-      for (const [candle, ratio] of confirmationCandles) {
-        const touched = candle.low <= upper && candle.high >= lower;
-        if (touched) {
-          triggeredZone = zone;
-          direction = 'LONG';
-          triggerRatio = ratio;
-          triggerCandle = candle;
-          break;
-        }
-      }
-      if (triggeredZone) break;
-    }
-
-    if (!triggeredZone) {
-      for (const zone of supplyZones) {
-        const lower = zone.bodyBottom * (1 - tolerance);
-        const upper = zone.bodyTop * (1 + tolerance * 2);
-        for (const [candle, ratio] of confirmationCandles) {
-          const touched = candle.high >= lower && candle.low <= upper;
-          if (touched) {
-            triggeredZone = zone;
-            direction = 'SHORT';
-            triggerRatio = ratio;
-            triggerCandle = candle;
-            break;
-          }
-        }
-        if (triggeredZone) break;
-      }
-    }
-
-    if (!triggeredZone || !direction) {
-      return { ok: true, near, signal: null };
-    }
-
-    if (this.lastTriggerBySymbol.get(symbol) === triggerCandle.openTime) {
-      return { ok: true, near, signal: null };
-    }
-
-    const hasOpen = [...this.signals.values()].some(
-      (s) => s.symbol === symbol && s.status === 'OPEN'
+    //  3) When the market RETESTS a marked level and the retest M1 candle closes as
+    //     a reversal candle with >=1.5x volume, the trade fires — once per level.
+    //  4) A close beyond the far side of the zone consumes the level.
+    //  5) Untested levels NEVER expire — every marked level is remembered until it
+    //     is consumed by a retest or a far-side close.
+    const markedLevels = [...this.untestedLevels.entries()].filter(
+      ([, level]) => level.symbol === symbol
     );
-    if (hasOpen) {
-      return { ok: true, near, signal: null };
+    const lastClosedIdx = m1.length - 2;
+
+    const badgeNear = (zone: NearZone | null): NearZone | null => {
+      if (!zone) return null;
+      const isMarked = markedLevels.some(
+        ([, level]) =>
+          level.timeframe === zone.timeframe &&
+          level.type === zone.type &&
+          level.bodyBottom === zone.bodyBottom &&
+          level.bodyTop === zone.bodyTop
+      );
+      return isMarked ? { ...zone, untested: true } : zone;
+    };
+
+    // Evaluate EVERY remembered untested level for this symbol: consume the ones
+    // that failed or finished their retest, and trade the first valid retest.
+    let retestSignal: NewSignal | null = null;
+    for (const [key, level] of markedLevels) {
+      const outcome = this.evaluateUntestedRetest(symbol, level, m1, lastClosedIdx, tolerance);
+      if (outcome.consumed) this.untestedLevels.delete(key);
+      if (outcome.signal) {
+        retestSignal = outcome.signal;
+        break;
+      }
+    }
+    if (retestSignal) {
+      return { ok: true, near: badgeNear(near), signal: retestSignal };
     }
 
-    // Mark the level UNTESTED on the first touch instead of trading it. The trade
-    // fires later on a retest with fresh M1 confirmation (see evaluateUntestedRetest).
-    this.untestedLevels.set(symbol, {
-      symbol,
-      direction,
-      timeframe: triggeredZone.timeframe,
-      type: triggeredZone.type,
-      bodyTop: triggeredZone.bodyTop,
-      bodyBottom: triggeredZone.bodyBottom,
-      triggerCandleOpen: triggerCandle.openTime,
-      triggerRatio,
-      markedAt: Date.now(),
-      sawDistancing: false,
-    });
-    this.lastTriggerBySymbol.set(symbol, triggerCandle.openTime);
-    return { ok: true, near: near ? { ...near, untested: true } : near, signal: null };
+    // FIRST TOUCH — the last closed M1 candle marks EVERY level it touches as
+    // UNTESTED (levels already marked are left untouched). No reversal or volume
+    // requirement here: marking is memory only. The trade fires later, on a
+    // retest with M1 confirmation.
+    for (const zone of [...demandZones, ...supplyZones]) {
+      const isDemand = zone.type === 'DEMAND';
+      const upper = isDemand
+        ? zone.bodyTop * (1 + tolerance)
+        : zone.bodyTop * (1 + tolerance * 2);
+      const lower = isDemand
+        ? zone.bodyBottom * (1 - tolerance * 2)
+        : zone.bodyBottom * (1 - tolerance);
+      for (const [candle, ratio] of confirmationCandles) {
+        const touched = isDemand
+          ? candle.low <= upper && candle.high >= lower
+          : candle.high >= lower && candle.low <= upper;
+        if (!touched) continue;
+        const key = untestedLevelKey(symbol, zone);
+        if (!this.untestedLevels.has(key)) {
+          this.untestedLevels.set(key, {
+            symbol,
+            direction: isDemand ? 'LONG' : 'SHORT',
+            timeframe: zone.timeframe,
+            type: zone.type,
+            bodyTop: zone.bodyTop,
+            bodyBottom: zone.bodyBottom,
+            triggerCandleOpen: candle.openTime,
+            triggerRatio: ratio,
+            markedAt: Date.now(),
+            sawDistancing: false,
+          });
+        }
+        break;
+      }
+    }
+    return { ok: true, near: badgeNear(near), signal: null };
   }
 
   /**
@@ -2414,9 +2406,8 @@ export class SignalEngine {
     lastClosedIdx: number,
     tolerance: number,
   ): { signal: NewSignal | null; consumed: boolean } {
-    if (Date.now() - untested.markedAt > UNTESTED_MAX_AGE_MS) {
-      return { signal: null, consumed: true };
-    }
+    // Untested levels NEVER expire by age: a marked level stays remembered
+    // until a retest or a far-side close consumes it.
     const isLong = untested.direction === 'LONG';
     let retested = false;
     const touchUpper = isLong
